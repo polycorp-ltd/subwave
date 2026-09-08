@@ -2006,6 +2006,15 @@ def render_transition(req):
     ]
     energies = {(b1, b2): _bar_rms(b1, b2) for b1, b2 in pairs}
     med_e = float(np.median(list(energies.values()))) if energies else 0.0
+
+    # Defined BEFORE the least-vocal fallback below uses it — it originally sat
+    # after that block, so the attempt-over-abstain path crashed on a free
+    # variable every time it fired (found by the offline simulator, 2026-09-09).
+    def _stem_bar_rms(name, b1, b2):
+        i, j = int((b1 - tail_start_s) * sr), int((b2 - tail_start_s) * sr)
+        seg = tail[name][i:j]
+        return float(np.sqrt(np.mean(seg ** 2))) if seg.shape[0] else 0.0
+
     usable = [
         (b1, b2)
         for b1, b2 in pairs
@@ -2031,10 +2040,6 @@ def render_transition(req):
     # of its bass or melodic ('other') stem energy; the latest such bar is the
     # producer's own transition moment. No such moment → the previous
     # last-full-energy-bar rule stands.
-    def _stem_bar_rms(name, b1, b2):
-        i, j = int((b1 - tail_start_s) * sr), int((b2 - tail_start_s) * sr)
-        seg = tail[name][i:j]
-        return float(np.sqrt(np.mean(seg ** 2))) if seg.shape[0] else 0.0
     _change_pick = None
     for idx in range(len(usable) - 1):
         b1, b2 = usable[idx]
