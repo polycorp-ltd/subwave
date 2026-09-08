@@ -45,6 +45,11 @@ interface BlendPlan {
   preset?: string | null; // which preset rendered (talk policy input)
   holdSec?: number;       // talk-hold bed actually baked in (voice rides it)
   structuralCut?: boolean; // cut landed on a detected structural outro boundary
+  // Feature snapshot for the mix-quality learning loop (fork: Mix Lab). Rides
+  // the armed booth-log meta so an exported seam joins its plan inputs without
+  // re-deriving them — the decision values as they were AT ARM TIME, which a
+  // later re-analysis pass can silently change.
+  features?: Record<string, unknown>;
 }
 
 function transitionsDir(): string {
@@ -303,6 +308,24 @@ export async function maybeRenderBlend(
     preset: result.preset ?? null,
     holdSec: result.talkHoldSec ?? undefined,
     structuralCut: result.structuralCut ?? false,
+    features: {
+      outId: outTrack.id,
+      inId: inTrack.id,
+      outBpm: outBpm ?? null,
+      inBpm: inn.bpm ?? null,
+      stretchRatio: stretchRatio ?? null,
+      stretched: allowStretch,
+      keyCompat: seamKeyCompat,
+      mildClash,
+      tempoClash,
+      votedPreset: preset,
+      outEnding: out.outro.ending ?? null,
+      inIntroMs: inn.introMs ?? null,
+      inMixInMs: inn.club?.mixInMs ?? null,
+      outMixOutMs: out.club?.mixOutMs ?? null,
+      bassCarry: seamKeyCompat >= 0.8,
+      talkHoldReqSec: opts.talkHoldSec ?? null,
+    },
   };
 }
 

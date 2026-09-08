@@ -1346,7 +1346,18 @@ class Queue {
                 item.cueOutSec = blend.blendStartSec;
                 successor.stemSeam = true;
                 successor.stemCueInSec = blend.inCueSec;
-                this.log('mix', `stem blend armed: ${item.track.title} ✕ ${successor.track.title} (${blend.preset || 'beat_carry'}${blend.structuralCut ? ', structural cut' : ''}, cut ${blend.blendStartSec}s, cue-in ${blend.inCueSec}s, clip ${blend.clipSec}s)`);
+                // The meta features ride to /api/state for the Mix Lab export
+                // harness — the plan inputs as they were at arm time, joined
+                // to the seam by the capture daemon (fork: Mix Lab loop).
+                this.log('mix', `stem blend armed: ${item.track.title} ✕ ${successor.track.title} (${blend.preset || 'beat_carry'}${blend.structuralCut ? ', structural cut' : ''}, cut ${blend.blendStartSec}s, cue-in ${blend.inCueSec}s, clip ${blend.clipSec}s)`, {
+                  ...(blend.features ?? {}),
+                  preset: blend.preset ?? 'beat_carry',
+                  structuralCut: !!blend.structuralCut,
+                  blendStartSec: blend.blendStartSec,
+                  inCueSec: blend.inCueSec,
+                  clipSec: blend.clipSec,
+                  holdSec: blend.holdSec ?? null,
+                });
                 // Seam talk policy (fork: Phase 5): the SUCCESSOR's link must
                 // not air OVER this rendered seam — but the DJ's talk is the
                 // station's USP and the persona only speaks every few tracks,
