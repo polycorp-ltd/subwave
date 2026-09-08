@@ -551,6 +551,13 @@ async def render_transition(req: RenderTransitionRequest):
         "blend_start_sec": msg.get("blend_start_sec"),
         "in_cue_sec": msg.get("in_cue_sec"),
         "clip_sec": msg.get("clip_sec"),
+        # Render descriptors the worker reports (fork): which preset actually
+        # rendered, whether the cut landed on a structural boundary, and the
+        # talk-hold bed length baked in. The sidecar drops unknown keys, so an
+        # older worker simply omits these and the controller keeps its nulls.
+        "preset": msg.get("preset"),
+        "structural_cut": msg.get("structural_cut"),
+        "talk_hold_sec": msg.get("talk_hold_sec"),
     }
 
 
