@@ -1988,8 +1988,15 @@ def render_transition(req):
     # own start (the closest renderable point to the true club cut).
     _mix_out = outro.get("mix_out_ms")
     if isinstance(_mix_out, (int, float)) and _mix_out > 0:
-        _mo_s = max(float(_mix_out) / 1000.0, tail_start_s + 2.0)
-        if _mo_s < _cut_ceiling:
+        _mo_s = float(_mix_out) / 1000.0
+        if _mo_s < tail_start_s + 4.0:
+            # The producer's cut lands BEFORE the decoded stem window (long DJ
+            # outro + a 45s tail). Clamping to the window start left <2s of
+            # cuttable bars and declined the exact tracks built for mixing
+            # (sim batches 2026-09-09: 4/6 'no-vocal-safe-out-bar'). An
+            # unreachable marker is ignored, not squeezed.
+            log(f"render_transition: club mix-out {_mo_s:.1f}s precedes stem window ({tail_start_s:.1f}s) — ignoring")
+        elif _mo_s < _cut_ceiling:
             _cut_ceiling = _mo_s
             log(f"render_transition: club mix-out at {_mo_s:.1f}s — cutting there")
     if _outro_idx is not None and _outro_idx < len(_tail_bar_bounds):
@@ -2004,6 +2011,12 @@ def render_transition(req):
         for b1, b2 in zip(out_bars, out_bars[1:])
         if b1 >= tail_start_s + 0.05 and b2 <= _cut_ceiling and 0.4 < (b2 - b1) < 4.0
     ]
+    if not pairs:
+        # Distinct from the vocal decline below — there were NO bar boundaries
+        # inside [tail_start, cut_ceiling] at all (ceiling collapsed, degenerate
+        # grid). The old path fell through to 'no-vocal-safe-out-bar' and
+        # misdirected a day of gate tuning.
+        return {"ok": False, "error": "no-cuttable-bars-in-window"}
     energies = {(b1, b2): _bar_rms(b1, b2) for b1, b2 in pairs}
     med_e = float(np.median(list(energies.values()))) if energies else 0.0
 
