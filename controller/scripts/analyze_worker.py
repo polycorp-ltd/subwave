@@ -2011,6 +2011,21 @@ def render_transition(req):
         for b1, b2 in zip(out_bars, out_bars[1:])
         if b1 >= tail_start_s + 0.05 and b2 <= _cut_ceiling and 0.4 < (b2 - b1) < 4.0
     ]
+    if not pairs:
+        # One-bar tolerance: the ceiling is an 11 kHz band-energy ESTIMATE,
+        # and a grid whose only candidate bar ends fractionally past it must
+        # not zero the window (live case "I'm on Fire": bar ends 311.9s,
+        # ceiling 311.0s — declined by 0.9s). Cutting one bar past the
+        # producer's estimated mix-out is inaudible; declining is not.
+        _tol_sp = [b2 - b1 for b1, b2 in zip(out_bars, out_bars[1:]) if 0.4 < (b2 - b1) < 4.0]
+        _tol = float(np.median(_tol_sp)) if _tol_sp else 2.0
+        pairs = [
+            (b1, b2)
+            for b1, b2 in zip(out_bars, out_bars[1:])
+            if b1 >= tail_start_s + 0.05 and b2 <= min(_cut_ceiling + _tol, dur_s - 3.0) and 0.4 < (b2 - b1) < 4.0
+        ]
+        if pairs:
+            log(f"render_transition: ceiling relaxed by one bar ({_cut_ceiling:.1f}s → {pairs[-1][1]:.1f}s max)")
     if not pairs and out_bars and out_bars[0] > _cut_ceiling:
         # The measured outro grid starts AFTER the cut ceiling (a cold ending
         # detected seconds before EOF while the club mix-out sits a chorus
