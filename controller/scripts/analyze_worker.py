@@ -2321,12 +2321,69 @@ def render_transition(req):
             return _env_gain(n, sr, points)
         de = in_bars[min(_drum_entry, _max_k)]
         be = in_bars[min(_bass_entry, _max_k)]
-        # Drums: full until the incoming beat lands, out over 1 bar (−3dB duck
-        # through the 1-bar handover keeps the double-kick civil).
-        loop_buf += _fwd("drums") * g_out * _env([(0.0, 1.0), (de, 0.7), (de + bar1, 0.0)])
-        # Bass: baton-pass when harmonically safe, otherwise out with the tune.
+        # ENERGY HOLD (Mix Lab batch 2, 2026-09-10). Holding the ENVELOPE at
+        # 1.0 until the incoming entry is not the same as holding the ENERGY:
+        # _fwd plays the outgoing's real forward audio, and on a fade-ending
+        # track that forward audio IS the fade — measured Earth ✕ The Sun: low
+        # band −44 dB over the 19s carry, rated 1 ("drums fade at 0:17,
+        # nothing until 0:35"). Per-bar makeup gain keeps the carried element
+        # at its cut-bar level until the hand-over; if the source truly dies
+        # (a boosted fade is just noise), the drum lane falls back to
+        # retriggering the energetic cut bar — the pre-dual-overlap loop, kept
+        # for exactly this case.
+        def _energy_hold(sig, hold_s, cap=2.5, floor_frac=0.12):
+            g = np.ones((n, 1), dtype=np.float32)
+            ref, held, dead, max_g = None, 0, 0, 1.0
+            for k in range(_max_k):
+                a = int(in_bars[k] * sr)
+                b = min(int(in_bars[min(k + 1, _max_k)] * sr), n)
+                if in_bars[k] >= hold_s:
+                    break
+                if b <= a:
+                    continue
+                r = float(np.sqrt(np.mean(sig[a:b] ** 2)))
+                if ref is None:
+                    ref = max(r, 1e-6)
+                    continue
+                held += 1
+                if r < floor_frac * ref:
+                    dead += 1
+                    continue
+                gk = min(cap, ref / max(r, 1e-6))
+                g[a:b] = gk
+                max_g = max(max_g, gk)
+            # 50ms smoothing so per-bar steps don't click.
+            k = max(1, int(0.05 * sr))
+            g[:, 0] = np.convolve(g[:, 0], np.ones(k, np.float32) / k, mode="same")
+            return g, (dead / held if held else 0.0), max_g
+        d_sig = _fwd("drums")
+        d_gain, d_dead, d_max = _energy_hold(d_sig, de)
+        d_env = _env([(0.0, 1.0), (de, 0.7), (de + bar1, 0.0)])
+        if d_dead > 0.5:
+            # Forward drums are gone well before the incoming lands — retrigger
+            # the cut bar per incoming bar (grid-locked, phase-fitted) instead.
+            tiled = np.zeros((n, 2), dtype=np.float32)
+            for k in range(_max_k):
+                b1i = int(in_bars[k] * sr)
+                b2i = min(int(in_bars[min(k + 1, _max_k)] * sr), n)
+                m = b2i - b1i
+                if m <= 0 or in_bars[k] >= de + bar1:
+                    continue
+                reps = int(np.ceil(m / max(drum_loop.shape[0], 1)))
+                tiled[b1i:b2i] = np.tile(drum_loop, (reps, 1))[:m]
+            loop_buf += tiled * g_out * d_env
+            log("render_transition: forward drums die before the incoming lands — retriggering cut bar")
+        else:
+            loop_buf += d_sig * d_gain * g_out * d_env
+            if d_max > 1.05:
+                log(f"render_transition: drum energy hold (makeup up to {20*np.log10(d_max):.1f} dB)")
+        # Bass: baton-pass when harmonically safe (same energy hold — a fading
+        # bass under a held drum lane is the same hole), otherwise out with the
+        # tune.
         if _bass_carry_ok:
-            loop_buf += _fwd("bass") * g_out * _env([(0.0, 1.0), (be, 1.0), (be + bar1, 0.0)])
+            b_sig = _fwd("bass")
+            b_gain, _b_dead, _b_max = _energy_hold(b_sig, be)
+            loop_buf += b_sig * b_gain * g_out * _env([(0.0, 1.0), (be, 1.0), (be + bar1, 0.0)])
         else:
             loop_buf += _fwd("bass") * g_out * _env([(0.0, 1.0), (in_bars[0] + 2 * bar1, 0.0)])
         # Melodic + vocals: hand the harmony over quickly — the incoming owns it.
