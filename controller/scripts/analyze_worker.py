@@ -2011,6 +2011,25 @@ def render_transition(req):
         for b1, b2 in zip(out_bars, out_bars[1:])
         if b1 >= tail_start_s + 0.05 and b2 <= _cut_ceiling and 0.4 < (b2 - b1) < 4.0
     ]
+    if not pairs and out_bars and out_bars[0] > _cut_ceiling:
+        # The measured outro grid starts AFTER the cut ceiling (a cold ending
+        # detected seconds before EOF while the club mix-out sits a chorus
+        # earlier — live case "I'm on Fire": outro at 348.7s, mix-out 311s).
+        # The stems still cover the ceiling region, so extrapolate the grid
+        # backward from the first outro bar at its own spacing and cut on
+        # those synthetic downbeats instead of declining.
+        _spacings = [b2 - b1 for b1, b2 in zip(out_bars, out_bars[1:]) if 0.4 < (b2 - b1) < 4.0]
+        _bar_len = float(np.median(_spacings)) if _spacings else (240.0 / outro["bpm"] if outro.get("bpm") else None)
+        if _bar_len and _bar_len > 0.4:
+            _synth = []
+            _b = out_bars[0]
+            while _b - _bar_len >= tail_start_s + 0.05:
+                _b -= _bar_len
+                _synth.append(_b)
+            _synth.reverse()
+            pairs = [(b1, b2) for b1, b2 in zip(_synth, _synth[1:]) if b2 <= _cut_ceiling]
+            if pairs:
+                log(f"render_transition: outro grid starts past the ceiling — extrapolated {len(pairs)} bars back to {pairs[0][0]:.1f}s")
     if not pairs:
         # Distinct from the vocal decline below — there were NO bar boundaries
         # inside [tail_start, cut_ceiling] at all (ceiling collapsed, degenerate
@@ -2519,8 +2538,13 @@ def render_transition(req):
                     continue
                 target = lvl_a + (lvl_b - lvl_a) * (k / max(len(_bar_rms) - 1, 1))
                 ride[a:b] = float(np.clip(target / _bar_rms[k], cap_lo, cap_hi))
+            # Edge-padded smoothing: a zero-padded 'same' convolve attenuates
+            # the first/last 50ms toward zero — a mini fade at the very
+            # junction this ride exists to protect (seen live: "max
+            # correction 6.0 dB" past the ±3 dB cap, 2026-09-10).
             ksm = max(1, int(0.1 * sr))
-            ride[:, 0] = np.convolve(ride[:, 0], np.ones(ksm, np.float32) / ksm, mode="same")
+            _padded = np.pad(ride[:, 0], (ksm, ksm), mode="edge")
+            ride[:, 0] = np.convolve(_padded, np.ones(ksm, np.float32) / ksm, mode="same")[ksm:-ksm]
             _max_ride = float(np.max(np.abs(20 * np.log10(np.maximum(ride, 1e-6)))))
             mix_buf[: _bar_edges[-1]] *= ride[: _bar_edges[-1]]
             if _max_ride > 0.5:
