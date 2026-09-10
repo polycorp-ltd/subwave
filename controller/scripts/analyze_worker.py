@@ -2240,21 +2240,39 @@ def render_transition(req):
         return default_k
     _drum_entry = min(max(_entry_bar("drums", CARRY_BARS), 2), _max_k - 1)
     _bass_entry = min(max(_entry_bar("bass", CARRY_BARS), 1), _max_k - 1)
+    # Bass baton-pass (operator insight, key-locked pairs only — bass is
+    # tonal): carry the outgoing BASS alongside the drums until the incoming
+    # track's bass measurably enters, so the low end never drops out of the
+    # seam. The controller signals harmonic safety via bass_carry_ok.
+    _bass_carry_ok = req.get("bass_carry_ok") is True
     mix_buf = np.zeros((n, 2), dtype=np.float32)
-    for name in ("bass", "other", "vocals"):
+    for name in ("other", "vocals"):
         mix_buf += to_stereo(head[name], n) * g_in
+    # Bass swap, not crossfade (mixing research 2026-09-10, after Vande Veire's
+    # auto-DJ): a pro transition never lets two basses coexist — the incoming
+    # low end sits shelved way down and opens only AT the swap point, one bar
+    # of ramp. Stem-domain equivalent: while the outgoing bass is being
+    # carried, gate the head's bass to −26 dB until the measured bass entry.
+    # Without a carry the incoming keeps its own intro bass untouched — gating
+    # it there would leave the low end owned by nobody.
+    head_bass = to_stereo(head["bass"], n) * g_in
+    if _bass_carry_ok:
+        _bswap = int(in_bars[min(_bass_entry, len(in_bars) - 1)] * sr)
+        _bar_n = max(int((in_bars[1] - in_bars[0]) * sr), sr // 4) if len(in_bars) > 1 else sr
+        bg = np.full((n, 1), 0.05, dtype=np.float32)
+        _bend = min(_bswap + _bar_n, n)
+        if _bswap < n:
+            bg[_bswap:_bend, 0] = np.linspace(0.05, 1.0, max(_bend - _bswap, 1), dtype=np.float32)
+            bg[_bend:] = 1.0
+        mix_buf += head_bass * bg
+    else:
+        mix_buf += head_bass
     # Incoming beat drops where it MEASURABLY lands, not on an assumed bar.
     dstart = int(in_bars[_drum_entry] * sr)
     head_drums = to_stereo(head["drums"], n) * g_in
     mix_buf[dstart:] += head_drums[dstart:]  # incoming beat drops on the downbeat
     if _drum_entry != CARRY_BARS:
         log(f"render_transition: incoming drums measured landing at bar {_drum_entry}")
-
-    # Bass baton-pass (operator insight, key-locked pairs only — bass is
-    # tonal): carry the outgoing BASS alongside the drums until the incoming
-    # track's bass measurably enters, so the low end never drops out of the
-    # seam. The controller signals harmonic safety via bass_carry_ok.
-    _bass_carry_ok = req.get("bass_carry_ok") is True
     # Phase fit (field failure: retriggered loop vs the incoming groove — the
     # bar grid's PHASE is the analyzer's documented blind spot, and a grid
     # half a beat off airs as "the beats don't match"). Instead of trusting
@@ -2449,6 +2467,40 @@ def render_transition(req):
                     lo = midpoint
             duck = lo
     mix_buf += loop_buf * duck
+
+    # Equal-power level ride (mixing research 2026-09-10, after Vande Veire's
+    # loudness balance): the summed transition should hold roughly constant
+    # energy from the seam's opening level to the incoming track's own level —
+    # the bump-then-dip of two overlapping sources is the `level_jump` class
+    # Dan rated 1.25 avg. Per-bar RMS of the SUM against a linear target
+    # between the first-two-bar level and the last-two-bar level, correction
+    # capped ±3 dB and smoothed over 100ms so it rides, never pumps.
+    try:
+        _bar_edges = [int(in_bars[k] * sr) for k in range(min(len(in_bars), _max_k + 1))]
+        _bar_rms = []
+        for k in range(len(_bar_edges) - 1):
+            a, b = _bar_edges[k], min(_bar_edges[k + 1], n)
+            seg = mix_buf[a:b]
+            _bar_rms.append(float(np.sqrt(np.mean(seg ** 2))) if seg.shape[0] else 0.0)
+        if len(_bar_rms) >= 4 and min(_bar_rms[:2]) > 1e-5 and min(_bar_rms[-2:]) > 1e-5:
+            lvl_a = float(np.mean(_bar_rms[:2]))
+            lvl_b = float(np.mean(_bar_rms[-2:]))
+            ride = np.ones((n, 1), dtype=np.float32)
+            cap_hi, cap_lo = 10 ** (3 / 20), 10 ** (-3 / 20)
+            for k in range(len(_bar_rms)):
+                a, b = _bar_edges[k], min(_bar_edges[k + 1], n)
+                if b <= a or _bar_rms[k] <= 1e-5:
+                    continue
+                target = lvl_a + (lvl_b - lvl_a) * (k / max(len(_bar_rms) - 1, 1))
+                ride[a:b] = float(np.clip(target / _bar_rms[k], cap_lo, cap_hi))
+            ksm = max(1, int(0.1 * sr))
+            ride[:, 0] = np.convolve(ride[:, 0], np.ones(ksm, np.float32) / ksm, mode="same")
+            _max_ride = float(np.max(np.abs(20 * np.log10(np.maximum(ride, 1e-6)))))
+            mix_buf[: _bar_edges[-1]] *= ride[: _bar_edges[-1]]
+            if _max_ride > 0.5:
+                log(f"render_transition: equal-power level ride (max correction {_max_ride:.1f} dB)")
+    except Exception as e:  # noqa: BLE001 — the ride is an upgrade, never a blocker
+        log(f"render_transition: level ride skipped ({e})")
 
     # Backstop: whatever the duck settled on, never hand the encoder a sample
     # that clips in 16-bit. Between the ceiling and here is ~1 dB of real
