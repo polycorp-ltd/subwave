@@ -278,6 +278,11 @@ export async function maybeRenderBlend(
       bars: inn.bars,
       gain_db: inGainDb,
       lufs: inn.loudnessLufs ?? null,
+      // Club mix-in (fork, mixing research): where the incoming track's
+      // groove actually lands — the worker sizes the carry to end THERE
+      // (Mixxx's rule: transition length from the pair's own intro span),
+      // instead of a fixed bar count.
+      mix_in_ms: inn.club?.mixInMs ?? null,
     },
     out_dir: transitionsDir(),
     clip_name: `${path.basename(String(outTrack.id))}-${path.basename(String(inTrack.id))}.wav`,

@@ -943,6 +943,9 @@ export interface RenderTransitionPayload {
     bars: number[];
     gain_db?: number | null;
     lufs?: number | null;
+    // Club mix-in (fork): where the incoming groove lands — the worker sizes
+    // the carry to end there (pair-derived transition length).
+    mix_in_ms?: number | null;
   };
   out_dir: string;
   clip_name: string;

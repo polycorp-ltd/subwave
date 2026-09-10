@@ -2067,6 +2067,13 @@ def render_transition(req):
         loop_b1, loop_b2 = _change_pick
         log(f"render_transition: cutting on an instrument change at {loop_b2:.1f}s")
     else:
+        # NOTE (mixing research 2026-09-10): an 8-bar phrase snap of this cut
+        # was tried and REVERTED — the golden suite caught it moving the
+        # verified-good Harpanet cut a full phrase (14s) early. The club
+        # mix-out ceiling already IS the phrase boundary (last-chorus end =
+        # the H→L switch point); the last usable bar before it is as
+        # phrase-anchored as this cut gets, and "aligned but earlier" is
+        # exactly the cut-too-early direction the operator flagged.
         loop_b1, loop_b2 = usable[-1]  # last full-energy bar before the wind-down
     blend_start_s = loop_b2        # out cue_out lands on this bar boundary
     i1 = int((loop_b1 - tail_start_s) * sr)
@@ -2084,12 +2091,31 @@ def render_transition(req):
     _head_probe_bars = [b / 1000.0 for b in (in_spec.get("bars") or []) if 0.0 <= b / 1000.0 <= ANALYZE_SECONDS - 1.0]
     _head_bounds = list(zip(_head_probe_bars, _head_probe_bars[1:]))
     _intro_bars = _structural_intro_bars(_melodic_ratio_per_bar(head, _head_bounds, sr)) if len(_head_bounds) >= 4 else 0
-    # Attempt-over-abstain + depth (operator call): default rides LONGER —
-    # floor 8 bars, cap 16 (~15-30s of genuine overlap), still clamped to
-    # what the head grid serves by the shrink logic below.
-    CARRY_BARS = max(8, min(16, _intro_bars if _intro_bars >= 4 else 8))
-    if CARRY_BARS > 4:
-        log(f"render_transition: incoming structural intro ~{_intro_bars} bars — carrying {CARRY_BARS}")
+    # Pair-derived carry (mixing research 2026-09-10, Mixxx's rule: the
+    # transition is sized from the pair's OWN intro/outro spans, and anchored
+    # so the incoming's intro ENDS — its groove drops — right as the outgoing
+    # ends). The club mix-in is the measured groove landing; carry to that
+    # bar, snapped DOWN to a 4-bar phrase edge, capped 24 (head window
+    # permitting). Falls back to the structural-intro estimate when no club
+    # marker exists.
+    _mix_in_ms = in_spec.get("mix_in_ms")
+    _mix_in_bar = None
+    if isinstance(_mix_in_ms, (int, float)) and _mix_in_ms > 0:
+        _mi_s = float(_mix_in_ms) / 1000.0
+        for _k, _b in enumerate(_head_probe_bars):
+            if _b >= _mi_s:
+                _mix_in_bar = _k
+                break
+    if _mix_in_bar is not None and _mix_in_bar >= 4:
+        CARRY_BARS = max(8, min(24, (_mix_in_bar // 4) * 4))
+        log(f"render_transition: incoming club mix-in at bar {_mix_in_bar} — carrying {CARRY_BARS} (pair-derived)")
+    else:
+        # Attempt-over-abstain + depth (operator call): default rides LONGER —
+        # floor 8 bars, cap 16 (~15-30s of genuine overlap), still clamped to
+        # what the head grid serves by the shrink logic below.
+        CARRY_BARS = max(8, min(16, _intro_bars if _intro_bars >= 4 else 8))
+        if CARRY_BARS > 4:
+            log(f"render_transition: incoming structural intro ~{_intro_bars} bars — carrying {CARRY_BARS}")
     # Full-mix bars after the drop before the decoder hand-off. 4, not 2: the
     # clip's play time is the ONLY runway Liquidsoap has to resolve + cue-seek
     # the incoming HTTP request behind it, and an ~11.7s six-bar clip lost that
