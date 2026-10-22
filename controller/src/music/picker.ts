@@ -14,6 +14,7 @@ import { logEvent } from '../observability/events.js';
 import * as settings from '../settings.js';
 import { bpmCompat, keyCompat } from './mix.js';
 import * as mixGraph from './mix-graph.js';
+import { chooseAutopilotCandidate } from '../broadcast/autopilot-policy.js';
 import * as libraryDb from './library-db.js';
 import { shuffle } from '../util/shuffle.js';
 import { mapPool } from '../util/async-pool.js';
@@ -846,7 +847,7 @@ function slimAlbum(album: string | null | undefined, title: string | null | unde
 // genuinely holds no other artist is the RIGHT answer there: the caller then
 // keeps its own pick and logs the relaxation. Unset on every other call, which
 // leaves the ordinary pool byte-identical.
-export async function pickViaPool(queue, ctx, rankTarget: { bpm: number | null; key: string | null } | null = null, audioWaypoint: number[] | null = null, opts: { avoidArtist?: string | null; mixRun?: boolean } = {}) {
+export async function pickViaPool(queue, ctx, rankTarget: { bpm: number | null; key: string | null } | null = null, audioWaypoint: number[] | null = null, opts: { avoidArtist?: string | null; mixRun?: boolean; seed?: Candidate | null; noLlm?: boolean } = {}) {
   await library.load();
   const stats = library.stats();
   // Sized off the MIRROR, not `stats.total`, which counts only TAGGED tracks.
@@ -858,7 +859,12 @@ export async function pickViaPool(queue, ctx, rankTarget: { bpm: number | null; 
   const windows = recencyWindowsForLibrary(stats.distinctArtists, librarySize);
   const { ids: recentIds, keys: recentKeys } = queue.recentlyPlayed(windows.trackHours);
   const recentArtists = queue.recentArtistsSince(windows.artistHours);
-  const currentTrack = queue.current?.track || null;
+  // The track this pick FOLLOWS. Under pair-aware drains that is the held
+  // predecessor, not the on-air track — the deadline pick runs a track (or,
+  // with pick lookahead, two) ahead (fork fix: the pool path seeded its
+  // similarity sources, compat re-rank and mix-graph stamps off the on-air
+  // track, so every pool pick was steered toward the WRONG seam).
+  const currentTrack = opts.seed ?? queue.current?.track ?? null;
   // DJ-mode gate for the pool path's `mix` stamps (fork: mix intelligence) —
   // same condition as the agent path's mixSeedId.
   const djMixActive = !!settings.getEffectivePersona()?.djMode;
@@ -962,6 +968,21 @@ export async function pickViaPool(queue, ctx, rankTarget: { bpm: number | null; 
     } else {
       queue.log('picker', `playlist [${tag}]: ${playlistInfo.matched}/${playlistInfo.total} in-playlist${playlistStrict ? ' (strict)' : ''}`);
     }
+  }
+
+  // Autopilot (fork, mixing round 2): no model call — the measured seam score
+  // from the on-deck track chooses, inside the same filtered pool. Before the
+  // offered-memory below: nothing was offered to a model, so nothing should
+  // accrue the penalty for being passed over.
+  if (opts.noLlm) {
+    const seedId = djMixActive ? currentTrack?.id ?? null : null;
+    const pick = chooseAutopilotCandidate(candidates, c => (seedId && c.id ? mixGraph.mixScore(seedId, c.id) : null));
+    if (!pick) return null;
+    return {
+      song: pick.choice,
+      reason: pick.score != null ? `autopilot (seam ${pick.score.toFixed(2)})` : 'autopilot (pool order)',
+      source: pick.choice._source,
+    };
   }
 
   // Offered-memory: every candidate reaching the model accrues its soft

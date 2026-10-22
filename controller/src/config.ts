@@ -112,6 +112,10 @@ export const config = {
     // link TTS + blend render all race one track's runtime. 1 = one more
     // track of runway for every seam.
     pickLookahead: envInt('PICK_LOOKAHEAD', 1, { min: 0, max: 2 }),
+    // Zero-token mix-graph picks when the DJ may not call the model (empty
+    // room under pauseWhenEmpty, daily cap spent) — broadcast/
+    // autopilot-policy.ts. 'off' = upstream's coast on auto.m3u.
+    autopilot: envEnum('AUTOPILOT', ['on', 'off'] as const, 'on') === 'on',
   },
   kokoro: {
     python: envStr('KOKORO_PYTHON', '/opt/kokoro/venv/bin/python'),

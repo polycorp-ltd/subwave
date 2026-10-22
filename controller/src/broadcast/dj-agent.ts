@@ -531,7 +531,7 @@ async function pickViaPool(queue, ctx, { wantLink, current, showAt = null }: { w
     opts = { ...opts, mixRun: true };
     queue.log('mix', `mix run: ${heldSeam ? 'queued item enters' : 'on-air track entered'} via a blend — steering this pick to keep the set mixing`);
   }
-  const result = await picker.pickViaPool(queue, ctx, rankTarget, audioWaypoint, opts);
+  const result = await picker.pickViaPool(queue, ctx, rankTarget, audioWaypoint, { ...opts, seed: current ?? null });
   if (!result) {
     queue.log('picker', 'pool produced no pick');
     return 'empty';
@@ -650,6 +650,14 @@ export async function runTrackEvent(queue, ctx, { wantLink, showAt = null, prede
     // playing). In the soft tier we still pick — the stream needs a next track —
     // but cheaply: the stateless pool picker, and no link.
     if (!budget.picksAllowed()) {
+      // Fork (autopilot): the cap forbids MODEL calls, not picks — a
+      // zero-token mix-graph pick keeps the seams mixing. Disallowed (non-DJ
+      // persona, env off) → upstream's coast, byte-for-byte.
+      if (typeof queue.autopilotAllowed === 'function' && queue.autopilotAllowed()) {
+        queue.log('budget', 'daily LLM token cap reached — autopilot picking (no model call)');
+        await runAutopilotPick(queue, ctx, { predecessor });
+        return;
+      }
       queue.log('budget', 'daily LLM token cap reached — coasting on the auto playlist');
       return;
     }
@@ -844,6 +852,30 @@ export async function runTrackEvent(queue, ctx, { wantLink, showAt = null, prede
       }
     }
     await pickViaPool(queue, ctx, { wantLink, current, showAt }, rankTarget, audioWaypoint);
+  });
+}
+
+// Mix-graph autopilot pick (fork, mixing round 2 — broadcast/autopilot-
+// policy.ts): the pool picker's filtered candidate pool, chosen by measured
+// seam score instead of a model call. Silent by construction — no link, no
+// session turn (the session is the DJ's own conversation; the autopilot is
+// not the DJ speaking). The caller has already decided the autopilot may run.
+export async function runAutopilotPick(queue, ctx, { predecessor = null }: { predecessor?: any | null } = {}): Promise<'queued' | 'empty' | 'collision'> {
+  return withTrace({ kind: 'autopilot-pick' }, async () => {
+    const current = predecessor ?? queue.current?.track ?? null;
+    const djMode = !!settings.getEffectivePersona()?.djMode;
+    // Same mini-run state the DJ's picks advance, so a run the LLM started
+    // keeps its tempo/key target through an autopilot stretch.
+    const { rankTarget, audioWaypoint } = advanceRun(djMode, current);
+    const result = await picker.pickViaPool(queue, ctx, rankTarget, audioWaypoint, {
+      seed: current, mixRun: true, noLlm: true,
+    });
+    if (!result) {
+      queue.log('picker', 'autopilot: pool empty — coasting on the auto playlist');
+      return 'empty';
+    }
+    const queued = await enqueuePick(queue, result.song, result.reason, 'autopilot', null, current);
+    return queued === -1 ? 'collision' : 'queued';
   });
 }
 

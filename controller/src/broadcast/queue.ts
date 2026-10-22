@@ -37,7 +37,8 @@ import type { PromptMemoryEntry } from './prompt-memory.js';
 import { getFullContext, getClockContext, energyForDaypart } from '../context.js';
 import * as settings from '../settings.js';
 import { logEvent } from '../observability/events.js';
-import { djCallsAllowed, presentListeners } from './listeners.js';
+import { djCallsAllowed, isStreamIdle, presentListeners } from './listeners.js';
+import { autopilotAllowed } from './autopilot-policy.js';
 import { autoVoiceAllowed } from './voice-policy.js';
 import { stationIdDaypartDrifted } from './clock-policy.js';
 import * as webhooks from './webhooks.js';
@@ -2276,9 +2277,47 @@ class Queue {
     // watcher still gets onTrackStarted events for those auto tracks, so the
     // first transition after a listener returns re-enters this block.
     const isAutonomous = this.current.source === 'auto' || this.current.source === 'ai';
-    if (this.autoPick && this.upcoming.length === 0 && !this.pickerBusy && djCallsAllowed()) {
-      this.runPickCycle({ isAutonomous });
+    if (this.autoPick && this.upcoming.length === 0 && !this.pickerBusy) {
+      if (djCallsAllowed()) this.runPickCycle({ isAutonomous });
+      else if (this.autopilotAllowed()) this.runAutopilotCycle();
     }
+  }
+
+  // Fork (mixing round 2): may the zero-token mix-graph autopilot fill a slot
+  // the DJ can't (broadcast/autopilot-policy.ts)? Read by the track-start and
+  // deadline pick sites below and by dj-agent's token-cap gate.
+  autopilotAllowed(): boolean {
+    return autopilotAllowed({
+      enabled: config.mixing.autopilot,
+      autoPick: this.autoPick,
+      pairDrain: this.pairDrainActive(),
+      streamIdle: isStreamIdle(),
+    });
+  }
+
+  // The autopilot's counterpart to runPickCycle: no session roll, programme
+  // plan, mic-pass or link — those are the DJ's, and they wait for the next
+  // model-allowed cycle. Only the show look-ahead survives, so the pick
+  // still follows the show that will be on air when it plays.
+  runAutopilotCycle({ predecessorItem = null }: { predecessorItem?: QueueItem | null } = {}) {
+    this.pickerBusy = true;
+    (async () => {
+      try {
+        const leadSec = pickLeadSec(
+          predecessorItem && this.upcoming.includes(predecessorItem)
+            ? this.remainingUntilItemAirs(predecessorItem)
+            : this.remainingSecOnAir(),
+          predecessorItem ? knownDurationSec(predecessorItem.track) : null,
+        );
+        const showAt = leadSec != null ? new Date(Date.now() + (leadSec + PICK_SHOW_LOOKAHEAD_SEC) * 1000) : null;
+        const ctx = await getFullContext(showAt ?? undefined);
+        await djAgent.runAutopilotPick(this, ctx, { predecessor: predecessorItem?.track ?? null });
+      } catch (err) {
+        this.log('error', `Autopilot pick failed: ${(err as Error).message}`);
+      } finally {
+        this.pickerBusy = false;
+      }
+    })();
   }
 
   // One full DJ pick cycle — session roll, programme plan, persona handoff,
@@ -2411,7 +2450,11 @@ class Queue {
   // away. Past the hard deadline the window closes and drainToLiquidsoap's
   // intrinsic path owns the endgame.
   maybeDeadlinePick() {
-    if (!this.autoPick || this.pickerBusy || !djCallsAllowed()) return;
+    if (!this.autoPick || this.pickerBusy) return;
+    // Model calls allowed → the DJ picks; otherwise the autopilot may
+    // (fork, mixing round 2) — never both, never neither by accident.
+    const llm = djCallsAllowed();
+    if (!llm && !this.autopilotAllowed()) return;
     if (!this.pairDrainActive()) return;
     const lookahead = config.mixing.pickLookahead;
     // The window is measured to when the held TAIL airs, not to the on-air
@@ -2432,7 +2475,8 @@ class Queue {
       // failed or never fired. Same backstop pick as onTrackStarted's.
       const isAutonomous = this.current?.source === 'auto' || this.current?.source === 'ai';
       this._deadlinePickAt = Date.now();
-      this.runPickCycle({ isAutonomous });
+      if (llm) this.runPickCycle({ isAutonomous });
+      else this.runAutopilotCycle();
       return;
     }
     if (!tail) return;
@@ -2440,7 +2484,8 @@ class Queue {
     // autonomous seams — a request brings its own intro, mirroring the
     // track-start path's source check.
     this._deadlinePickAt = Date.now();
-    this.runPickCycle({ isAutonomous: !tail.requestedBy, predecessorItem: tail });
+    if (llm) this.runPickCycle({ isAutonomous: !tail.requestedBy, predecessorItem: tail });
+    else this.runAutopilotCycle({ predecessorItem: tail });
   }
 
   // Did the pick we just pushed actually become a playable request? (#1405)
