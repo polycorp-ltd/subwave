@@ -6,6 +6,7 @@
 import assert from 'node:assert/strict';
 import {
   remainingSec, drainAction, shouldDeadlinePick, introRenderBudgetSec,
+  deadlinePickTarget, LOOKAHEAD_WINDOW_SEC,
   DRAIN_DEADLINE_SEC, HARD_DEADLINE_SEC, DEADLINE_PICK_COOLDOWN_SEC,
   DRAIN_COMMIT_RESERVE_SEC, MIN_PRERENDER_BUDGET_SEC,
 } from '../src/broadcast/drain-policy.js';
@@ -164,5 +165,27 @@ assert.ok(
 // The reserve must cover the commit tail it is named for: two writeHandoff
 // waits (5s each) plus slack. Shrinking it below that reintroduces #1409.
 assert.ok(DRAIN_COMMIT_RESERVE_SEC >= 10, 'reserve covers both 5s handoff waits');
+
+// ── deadlinePickTarget (fork: pick lookahead) ────────────────────────────────
+
+// lookahead 0 is upstream's rule: only a held HEAD earns a successor pick.
+assert.equal(deadlinePickTarget([false], 0), 0, 'held head, no lookahead → pick for it');
+assert.equal(deadlinePickTarget([true, false], 0), -1, 'held tail behind a sent item, no lookahead → wait');
+assert.equal(deadlinePickTarget([], 0), -1, 'empty queue is the backstop branch, not a target');
+assert.equal(deadlinePickTarget([true], 0), -1, 'nothing held → nothing to pick for');
+// lookahead 1: the tail may sit one sent item deep — its seam gets that
+// item's runtime as extra runway.
+assert.equal(deadlinePickTarget([false], 1), 0, 'held head still picks with lookahead');
+assert.equal(deadlinePickTarget([true, false], 1), 1, 'held tail one deep → pick for it');
+assert.equal(deadlinePickTarget([true, true, false], 1), -1, 'two deep exceeds lookahead 1 → self-limits');
+assert.equal(deadlinePickTarget([true, true, false], 2), 2, 'lookahead 2 allows two deep');
+// Exactly one unsent item, and it is the tail — otherwise the drain owns it.
+assert.equal(deadlinePickTarget([false, false], 1), -1, 'two unsent: the drain sends the head first');
+assert.equal(deadlinePickTarget([true, false, true], 2), -1, 'unsent item not at the tail → no pick');
+// The window widens per lookahead level; lookahead 0 is byte-for-byte upstream.
+assert.equal(shouldDeadlinePick(DRAIN_DEADLINE_SEC + 10, 0), false, 'outside upstream window');
+assert.equal(shouldDeadlinePick(DRAIN_DEADLINE_SEC + 10, 1), true, 'lookahead opens the window');
+assert.equal(shouldDeadlinePick(DRAIN_DEADLINE_SEC + LOOKAHEAD_WINDOW_SEC + 1, 1), false, 'but not unbounded');
+assert.equal(shouldDeadlinePick(HARD_DEADLINE_SEC - 1, 1), false, 'hard fallback still owns the endgame');
 
 console.log('drain-policy: all assertions passed');

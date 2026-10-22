@@ -48,7 +48,7 @@ import {
   introRenderBudgetSec,
   playableDurationSec,
   remainingSec,
-  shouldDeadlinePick,
+  shouldDeadlinePick, deadlinePickTarget,
   DEADLINE_PICK_COOLDOWN_SEC,
 } from './drain-policy.js';
 import {
@@ -2320,8 +2320,12 @@ class Queue {
         // here and the :00 cron won it mid-song, airing the changeover track
         // (already picked under the incoming brief) BEFORE anyone handed over.
         // With one date there is no second date to disagree with.
+        // (fork: pick lookahead) a held predecessor may sit behind sent
+        // items, so the clock runs to when IT airs, not the on-air end.
         const leadSec = pickLeadSec(
-          this.remainingSecOnAir(),
+          predecessorItem && this.upcoming.includes(predecessorItem)
+            ? this.remainingUntilItemAirs(predecessorItem)
+            : this.remainingSecOnAir(),
           predecessorItem ? knownDurationSec(predecessorItem.track) : null,
         );
         let showAt: Date | null = null;
@@ -2376,7 +2380,7 @@ class Queue {
           wantLink,
           showAt,
           predecessor: predecessorItem?.track ?? null,
-          prior: predecessorItem ? (this.current?.track ?? null) : null,
+          prior: predecessorItem ? this.trackBefore(predecessorItem) : null,
         });
       } catch (err) {
         this.log('error', `DJ track event failed: ${(err as Error).message}`);
@@ -2384,6 +2388,15 @@ class Queue {
         this.pickerBusy = false;
       }
     })();
+  }
+
+  // The track that airs immediately before ITEM: the queued item ahead of it,
+  // else whatever is on air (fork: pick lookahead — the held predecessor is
+  // no longer always the head).
+  trackBefore(item: QueueItem): Track | null {
+    const idx = this.upcoming.indexOf(item);
+    if (idx > 0) return this.upcoming[idx - 1].track;
+    return this.current?.track ?? null;
   }
 
   // Pair-drain deadline routine, run every watcher tick. When the on-air track
@@ -2400,8 +2413,15 @@ class Queue {
   maybeDeadlinePick() {
     if (!this.autoPick || this.pickerBusy || !djCallsAllowed()) return;
     if (!this.pairDrainActive()) return;
-    const rem = this.remainingSecOnAir();
-    if (!shouldDeadlinePick(rem)) return;
+    const lookahead = config.mixing.pickLookahead;
+    // The window is measured to when the held TAIL airs, not to the on-air
+    // track's end — with lookahead the tail can sit behind sent items, and
+    // remainingUntilItemAirs extends the clock past them. For a held head
+    // the two are the same number (upstream's case).
+    const tailIdx = deadlinePickTarget(this.upcoming.map(i => !!i.sent), lookahead);
+    const tail = tailIdx >= 0 ? this.upcoming[tailIdx] : null;
+    const rem = tail ? this.remainingUntilItemAirs(tail) : this.remainingSecOnAir();
+    if (!shouldDeadlinePick(rem, tail ? lookahead : 0)) return;
     // Attempt cooldown: the watcher tick re-enters every 1.5s for the whole
     // window, so a FAST-failing pick (LLM host down) would otherwise re-fire
     // dozens of times per window. A success stops matching the conditions
@@ -2415,14 +2435,12 @@ class Queue {
       this.runPickCycle({ isAutonomous });
       return;
     }
-    const head = this.upcoming[0];
-    const unsent = this.upcoming.filter(i => !i.sent);
-    if (head.sent || unsent.length !== 1 || unsent[0] !== head) return;
-    // The held head needs a successor: pick what follows it. Links only ride
+    if (!tail) return;
+    // The held tail needs a successor: pick what follows it. Links only ride
     // autonomous seams — a request brings its own intro, mirroring the
     // track-start path's source check.
     this._deadlinePickAt = Date.now();
-    this.runPickCycle({ isAutonomous: !head.requestedBy, predecessorItem: head });
+    this.runPickCycle({ isAutonomous: !tail.requestedBy, predecessorItem: tail });
   }
 
   // Did the pick we just pushed actually become a playable request? (#1405)

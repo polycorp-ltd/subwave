@@ -102,6 +102,17 @@ export const config = {
     // worker.
     renderTimeoutMs: envInt('ANALYZE_RENDER_TIMEOUT_MS', 60_000),
   },
+  // Fork (obscura): DJ-mixing knobs that are ops levers, not operator
+  // settings — env so a misbehaving one can be rolled back with a compose
+  // edit and a recreate, no rebuild.
+  mixing: {
+    // Extra tracks the pair-drain picks AHEAD of the held tail (drain-policy
+    // `deadlinePickTarget`). 0 = upstream behaviour: the held item's
+    // successor is picked during the track before it, so a seam's pick +
+    // link TTS + blend render all race one track's runtime. 1 = one more
+    // track of runway for every seam.
+    pickLookahead: envInt('PICK_LOOKAHEAD', 1, { min: 0, max: 2 }),
+  },
   kokoro: {
     python: envStr('KOKORO_PYTHON', '/opt/kokoro/venv/bin/python'),
     workerScript: envStr('KOKORO_WORKER', '/app/scripts/kokoro_worker.py'),

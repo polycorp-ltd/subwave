@@ -142,6 +142,36 @@ export function drainAction(opts: {
 // pointless (the hard fallback owns the endgame; a pick landing after the
 // intrinsic send would just sit in the queue an extra cycle — harmless, so
 // the window extends to the hard deadline itself).
-export function shouldDeadlinePick(remaining: number | null): boolean {
-  return remaining != null && remaining < DRAIN_DEADLINE_SEC && remaining >= HARD_DEADLINE_SEC;
+export function shouldDeadlinePick(remaining: number | null, lookahead = 0): boolean {
+  const window = DRAIN_DEADLINE_SEC + Math.max(0, lookahead) * LOOKAHEAD_WINDOW_SEC;
+  return remaining != null && remaining < window && remaining >= HARD_DEADLINE_SEC;
+}
+
+// Fork (obscura, mixing round 2): how much further the deadline window opens
+// per lookahead level. A held tail sitting behind one sent-but-unaired track
+// is a full track further from air, so its pick may start that much earlier.
+export const LOOKAHEAD_WINDOW_SEC = 600;
+
+// Which queued item, if any, the deadline routine should pick a successor
+// FOR (fork, mixing round 2 — "every seam gets runway").
+//
+// lookahead 0 is upstream's rule byte-for-byte: only a held HEAD (the item
+// airing right after the on-air track) earns a successor pick, so the pick,
+// the successor's link TTS and the blend render all race the on-air track's
+// remaining runtime — on a slow local model that race is routinely lost
+// ("seam not evaluated").
+//
+// lookahead N lets the held TAIL sit up to N sent items deep. The pick for it
+// fires while those sent items are still ahead, so its seam gets their
+// runtime too. Still self-limiting: exactly one unsent item, and it must be
+// the tail — a pick that lands makes the tail sendable, the drain sends it,
+// and the new tail sits one deeper than allowed until a track airs.
+//
+// Returns the tail's index, or -1 for "nothing to pick for".
+export function deadlinePickTarget(sentFlags: readonly boolean[], lookahead = 0): number {
+  if (sentFlags.length === 0) return -1;
+  const tail = sentFlags.length - 1;
+  if (sentFlags[tail]) return -1;
+  for (let i = 0; i < tail; i++) if (!sentFlags[i]) return -1;
+  return tail <= Math.max(0, lookahead) ? tail : -1;
 }
