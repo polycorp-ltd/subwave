@@ -518,6 +518,16 @@ class RenderTransitionRequest(BaseModel):
     out_dir: str
     clip_name: str | None = None
     target_lufs: float | None = None
+    # Render controls (fork). Pydantic drops undeclared keys, so before these
+    # were declared every one of them was silently stripped on the sidecar
+    # path — the live path — and the station aired the plain unstretched beat
+    # carry no matter what the controller planned: no tempo lock, no bass
+    # baton, no echo_out/layered presets, no talk-hold beds (found
+    # 2026-10-23; the in-process worker path always had them).
+    allow_stretch: bool | None = None
+    bass_carry_ok: bool | None = None
+    talk_hold_sec: float | None = None
+    preset: str | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -539,6 +549,10 @@ async def render_transition(req: RenderTransitionRequest):
         payload["clip_name"] = req.clip_name
     if req.target_lufs is not None:
         payload["target_lufs"] = req.target_lufs
+    for k in ("allow_stretch", "bass_carry_ok", "talk_hold_sec", "preset"):
+        v = getattr(req, k)
+        if v is not None:
+            payload[k] = v
     msg = await analyzer_worker.request(payload)
     if not msg.get("ok"):
         # A clean miss (stems absent, degenerate grids) is an expected
@@ -558,6 +572,9 @@ async def render_transition(req: RenderTransitionRequest):
         "preset": msg.get("preset"),
         "structural_cut": msg.get("structural_cut"),
         "talk_hold_sec": msg.get("talk_hold_sec"),
+        # Render diagnostics (fork, mixing round 2): alignment residuals etc.
+        # for the A/B harness and the booth meta. Absent from older workers.
+        **({"diag": msg["diag"]} if isinstance(msg.get("diag"), dict) else {}),
     }
 
 
