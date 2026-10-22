@@ -116,6 +116,9 @@ export const config = {
     // room under pauseWhenEmpty, daily cap spent) — broadcast/
     // autopilot-policy.ts. 'off' = upstream's coast on auto.m3u.
     autopilot: envEnum('AUTOPILOT', ['on', 'off'] as const, 'on') === 'on',
+    // Mini-runs follow the hour's set arc (broadcast/set-arc.ts): Camelot +1
+    // per pick to lift, -1 to release. 'off' = the legacy fixed ±6 BPM run.
+    setArc: envEnum('SET_ARC', ['on', 'off'] as const, 'on') === 'on',
   },
   kokoro: {
     python: envStr('KOKORO_PYTHON', '/opt/kokoro/venv/bin/python'),

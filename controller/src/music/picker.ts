@@ -746,7 +746,14 @@ async function buildCandidates(mood: string | null | undefined, recentIds: Set<s
   // continuations — the seven discovery sources have no notion of seam
   // compatibility, so on an off night the re-rank had nothing mixable to
   // lift. Injected rows ride the normal dedup/recency/artist-cap below.
-  if (mixSeedId) {
+  //
+  // Not when the show pins music filters or a playlist (fork fix, mixing
+  // round 2): injection happens AFTER the sources were show-filtered, so a
+  // strict genre/era/playlist show leaked off-brief graph neighbours into the
+  // pool — and the autopilot, which chooses by seam score, would pick them.
+  // The operator's brief outranks the mix; the graph still boosts the
+  // re-rank among the on-brief candidates the sources found.
+  if (mixSeedId && !narrow) {
     const have = new Set(selectionPool.map((c: any) => c.id));
     for (const e of mixGraph.edgesFor(mixSeedId, mixRun ? 20 : 8)) {
       if (have.has(e.toId)) continue;

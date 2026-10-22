@@ -11,6 +11,8 @@ import * as journey from '../../music/journey.js';
 import { shiftOnsetMs } from '../../music/silence-trim.js';
 import { shuffle } from '../../util/shuffle.js';
 import { energyForDaypart } from '../../context.js';
+import { config } from '../../config.js';
+import { arcDirection, stepBpm, stepCamelot, type ArcDirection } from '../set-arc.js';
 
 // --- Feature 4: DJ-mode mini-runs ------------------------------------------
 // A short, deliberate tempo/key journey across 2-3 consecutive picks. While a
@@ -30,6 +32,10 @@ interface RunState {
   bpm: number | null;
   key: string | null;
   remaining: number;
+  // Set-arc direction (fork, mixing round 2): each pick of the run steps the
+  // target one Camelot number + ~2.5% tempo this way. Absent = the legacy
+  // fixed-target run (SET_ARC=off).
+  dir?: ArcDirection;
   waypoints?: number[][];
   step?: number;
 }
@@ -41,6 +47,10 @@ let runState: RunState | null = null;
 interface RunStep {
   rankTarget: { bpm: number | null; key: string | null } | null;
   audioWaypoint: number[] | null;
+  // Where this pick sits in a run (fork, mixing round 2 — mix-set framing):
+  // 'start' opens one, 'mid'/'end' continue it, null = no run. The DJ talks
+  // INTO a run and after it, never inside it.
+  phase: 'start' | 'mid' | 'end' | null;
 }
 
 // How many candidate tracks to average for a destination-vibe centroid. Capped
@@ -119,7 +129,11 @@ export function introMsOf(track: any): number | null {
 
 // Probability of STARTING a run on a given pick, by chattiness. Quiet personas
 // never start one; a run is a presence behaviour like the rest of DJ mode.
-function runStartProbability(): number {
+function runStartProbability(minimum = 0): number {
+  return Math.max(minimum, chattinessProbability());
+}
+
+function chattinessProbability(): number {
   const f = settings.effectiveFrequency();
   if (f === 'aggressive') return 0.5;
   if (f === 'chatty') return 0.4;
@@ -132,31 +146,51 @@ function runStartProbability(): number {
 // tempo/key re-rank to the current track as usual"; audioWaypoint null means
 // "no journey — the audio source anchors to the current track". Only does
 // anything in DJ mode with an analysed current track.
-const NO_RUN: RunStep = { rankTarget: null, audioWaypoint: null };
+const NO_RUN: RunStep = { rankTarget: null, audioWaypoint: null, phase: null };
 
-export function advanceRun(djMode: boolean, current: any): RunStep {
+// `minStartProbability` lets a caller that is not the chatty DJ still start
+// runs — the autopilot (fork) has no persona presence to express, but a
+// coasting station should still play sets, not singles.
+export function advanceRun(djMode: boolean, current: any, { minStartProbability = 0 }: { minStartProbability?: number } = {}): RunStep {
   if (!djMode) { runState = null; return NO_RUN; }
   if (runState && runState.remaining > 0) {
     runState.remaining--;
     const waypoint = takeWaypoint(runState);
+    if (runState.dir) {
+      // Arc run: the target walks — one wheel step + one tempo step per pick.
+      runState.key = stepCamelot(runState.key, runState.dir);
+      runState.bpm = stepBpm(runState.bpm, runState.dir);
+    }
     if (runState.remaining <= 0) {
       const rankTarget = { bpm: runState.bpm, key: runState.key };
       runState = null;
-      return { rankTarget, audioWaypoint: waypoint };
+      return { rankTarget, audioWaypoint: waypoint, phase: 'end' };
     }
-    return { rankTarget: { bpm: runState.bpm, key: runState.key }, audioWaypoint: waypoint };
+    return { rankTarget: { bpm: runState.bpm, key: runState.key }, audioWaypoint: waypoint, phase: 'mid' };
   }
   // No active run — maybe start one off the current track.
   const cur = analysisOf(current);
-  if ((cur.bpm == null && cur.key == null) || Math.random() >= runStartProbability()) return NO_RUN;
-  const target = mix.pickRunTarget(cur, energyForDaypart());
+  if ((cur.bpm == null && cur.key == null) || Math.random() >= runStartProbability(minStartProbability)) return NO_RUN;
+  let target: { bpm: number | null; key: string | null } | null;
+  let dir: ArcDirection | undefined;
+  if (config.mixing.setArc) {
+    dir = arcDirection(new Date(), energyForDaypart().speed);
+    target = { bpm: stepBpm(cur.bpm, dir), key: stepCamelot(cur.key, dir) };
+  } else {
+    target = mix.pickRunTarget(cur, energyForDaypart());
+  }
   if (!target) return NO_RUN;
   const extra = 1 + Math.floor(Math.random() * 2); // 1-2 more picks after this
-  runState = { bpm: target.bpm, key: target.key, remaining: extra };
+  runState = { bpm: target.bpm, key: target.key, remaining: extra, ...(dir ? { dir } : {}) };
   // Overlay a sonic journey if the audio index can support one (this pick + the
   // `extra` that follow → extra + 1 total waypoints). No-op otherwise.
   maybeAttachJourney(runState, current, extra + 1);
-  return { rankTarget: target, audioWaypoint: takeWaypoint(runState) };
+  return { rankTarget: target, audioWaypoint: takeWaypoint(runState), phase: 'start' };
+}
+
+// The live run's arc direction, for the booth log. null = no run / legacy run.
+export function runDirection(): ArcDirection | null {
+  return runState?.dir ?? null;
 }
 
 export function runActive(): boolean {

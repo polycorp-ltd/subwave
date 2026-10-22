@@ -52,7 +52,7 @@ import {
   breakerSuccess,
 } from './dj-agent/breaker.js';
 import { dropEchoedLink, enqueuePick, trackFields, trimLinkToIntro } from './dj-agent/enqueue.js';
-import { advanceRun, runActive } from './dj-agent/runs.js';
+import { advanceRun, runActive, runDirection } from './dj-agent/runs.js';
 import { pickSchemaBase, pickSystem, requestSystem } from './dj-agent/schemas.js';
 import { guardIntro, screenAck, isNamedRequester } from '../util/request-guard.js';
 import * as likes from './likes.js';
@@ -677,8 +677,18 @@ export async function runTrackEvent(queue, ctx, { wantLink, showAt = null, prede
     // Feature 4 + Phase 2 — advance/maybe-start a mini-run; get the tempo/key
     // re-rank target and (when the audio index supports it) a sonic-journey
     // waypoint for the pool's audio anchor.
-    const { rankTarget, audioWaypoint } = advanceRun(djMode, current);
+    const { rankTarget, audioWaypoint, phase: runPhase } = advanceRun(djMode, current);
     const inRun = runActive();
+    // Mix-set framing (fork, mixing round 2): the DJ talks up INTO a run and
+    // after it, never inside it — a set mixes straight through. The skipped
+    // slot isn't banked; the link cadence carries on from here.
+    if (runPhase === 'start' && rankTarget) {
+      queue.log('mix', `set run starting (${runDirection() ?? 'drift'}) → target ${rankTarget.key ?? '?'} @ ${rankTarget.bpm ?? '?'} BPM`);
+    }
+    if (wantLink && (runPhase === 'mid' || runPhase === 'end')) {
+      wantLink = false;
+      queue.log('mix', 'link held — mid-set, the run mixes straight through');
+    }
 
     // In DJ mode the link TEASES the next track — artist or feel — rather than
     // just announcing it. The agent already knows its own pick when it writes
@@ -866,7 +876,9 @@ export async function runAutopilotPick(queue, ctx, { predecessor = null }: { pre
     const djMode = !!settings.getEffectivePersona()?.djMode;
     // Same mini-run state the DJ's picks advance, so a run the LLM started
     // keeps its tempo/key target through an autopilot stretch.
-    const { rankTarget, audioWaypoint } = advanceRun(djMode, current);
+    // Autopilot plays sets too: no persona presence to gate run starts on,
+    // so a floor probability stands in for the chattiness table.
+    const { rankTarget, audioWaypoint } = advanceRun(djMode, current, { minStartProbability: 0.35 });
     const result = await picker.pickViaPool(queue, ctx, rankTarget, audioWaypoint, {
       seed: current, mixRun: true, noLlm: true,
     });
