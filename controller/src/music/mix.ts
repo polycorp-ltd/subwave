@@ -254,6 +254,36 @@ export function keyCompat(a: string | null, b: string | null): number {
   return 0;
 }
 
+// Transpose a Camelot code by whole semitones. Each wheel step is a fifth
+// (7 semitones), so +1 semitone moves the number +7 (mod 12) and keeps the
+// ring. null for an unparsable code.
+export function transposeCamelot(code: string | null, semitones: number): string | null {
+  const k = parseCamelot(code);
+  if (!k || !Number.isInteger(semitones)) return null;
+  const n = ((((k.n - 1 + 7 * semitones) % 12) + 12) % 12) + 1;
+  return `${n}${k.letter}`;
+}
+
+// Key-fix (fork, mixing round 2): the ±1 semitone retune of the OUTGOING
+// side that turns a harmonic clash into a Camelot-safe seam — the move real
+// DJs make on 2.5% of tracks (94% of those by exactly one semitone, Kim et
+// al. ISMIR 2020). 0 when the seam is already compatible or no single
+// semitone fixes it; on a tie the smaller retune wins (+1 before -1).
+export function keyFixSemitones(outKeyEnd: string | null, inKeyStart: string | null): number {
+  if (!parseCamelot(outKeyEnd) || !parseCamelot(inKeyStart)) return 0;
+  if (keyCompat(outKeyEnd, inKeyStart) >= 0.8) return 0;
+  let best = 0;
+  let bestCompat = 0;
+  for (const s of [1, -1]) {
+    const c = keyCompat(transposeCamelot(outKeyEnd, s), inKeyStart);
+    if (c >= 0.8 && c > bestCompat) {
+      best = s;
+      bestCompat = c;
+    }
+  }
+  return best;
+}
+
 // Overall mix compatibility 0..1 — tempo weighted a touch over key, matching
 // the pool re-rank's intent (a beat that locks matters more to a blend than a
 // key that's merely adjacent). Key compares the pair the seam actually meets:

@@ -131,6 +131,19 @@ def _env_float(name, default):
         return default
 
 
+# Stem-cache windows (fork, mixing round 2 — long blends). The stem cache may
+# separate LONGER windows than the analysis reads: a 32-bar ride (~60s at
+# house tempi) needs ~70s of incoming head and of outgoing material past the
+# cut, while BPM/key/intro/vocal analysis stays on its own windows. Vocal
+# detection runs on the analysis-window slice of the longer separation, so
+# `vocal_ranges` / the tail vocal ranges are byte-for-byte what the shorter
+# window measured. Unset = the analysis windows, i.e. today's cache exactly.
+# Raising either only takes effect as tracks are re-separated (clear
+# tracks.stems_at and let the resumable backfill run).
+STEM_HEAD_SECONDS = max(ANALYZE_SECONDS, _env_float("ANALYZE_STEM_HEAD_SECONDS", ANALYZE_SECONDS))
+STEM_TAIL_SECONDS = max(OUTRO_SECONDS, _env_float("ANALYZE_STEM_TAIL_SECONDS", OUTRO_SECONDS))
+
+
 # Vocal-stem gate thresholds (issue #1125). The stem is thresholded against BOTH
 # its own loud level (self-relative, catches quiet-but-present vocals) AND a
 # fraction of the FULL-MIX loud level (an absolute-ish floor). Demucs never
@@ -1650,7 +1663,7 @@ _LAYERED_LOCK_RATIO = 0.008
 
 def _render_layered(preset, tail, head, *, tail_start_s, dur_s, sr, out_bars,
                     wind_down_s, in_bars, g_in, g_out, allow_stretch,
-                    out_dir, clip_name, out_vox=(), cut_ceiling_s=None):
+                    out_dir, clip_name, out_vox=(), cut_ceiling_s=None, key_shift=0):
     """Render one layered preset, or None when its constraints can't be met
     (caller falls back to the beat carry). All times in seconds; out_bars /
     in_bars already converted from the stored ms grids."""
@@ -1667,7 +1680,14 @@ def _render_layered(preset, tail, head, *, tail_start_s, dur_s, sr, out_bars,
     # widened for. Envelope tables index bt[] via min(k, len-1) semantics
     # below, so a longer bt simply stretches the ride.
     overlap_candidates = [overlap]
-    if preset in ("bass_swap", "harmonic_sustain") and len(in_bars) >= 17:
+    if preset in ("bass_swap", "harmonic_sustain") and len(in_bars) >= 33:
+        # Long ride (fork, mixing round 2): real DJ transitions cluster at
+        # 32-beat multiples and run long (Kim et al., ISMIR 2020). Reachable
+        # only with longer stem windows (STEM_HEAD/TAIL_SECONDS); the tail-
+        # material loop below steps down to 16/8 when the outgoing side can't
+        # serve it.
+        overlap_candidates = [32, 16, overlap]
+    elif preset in ("bass_swap", "harmonic_sustain") and len(in_bars) >= 17:
         overlap_candidates = [16, overlap]  # try the full ride, step down to 8
     overlap_candidates = [o for o in overlap_candidates if len(in_bars) >= o + 1] or [max(4, len(in_bars) - 1)]
     if len(in_bars) < overlap_candidates[-1] + 1:
@@ -1783,6 +1803,12 @@ def _render_layered(preset, tail, head, *, tail_start_s, dur_s, sr, out_bars,
             seg = pyrubberband.time_stretch(
                 seg.astype(np.float64), sr, raw_total / in_cue_s
             ).astype(np.float32)
+        if key_shift and name in ("bass", "other", "vocals"):
+            # Glide over the first two incoming bars (clip time) — the
+            # harmony presets bring the incoming tonal stems up from bar ~2.
+            g = _pitch_glide(_stereo_n(seg, seg.shape[0]), sr, key_shift, 0.0, max(0.5, in_bars[min(2, len(in_bars) - 1)]))
+            if g is not None:
+                seg = g
         seg = _stereo_n(seg, n)
         out_buf += seg * g_out * _env_gain(n, sr, out_pts[name])
 
@@ -1847,7 +1873,79 @@ def _render_layered(preset, tail, head, *, tail_start_s, dur_s, sr, out_bars,
         "in_cue_sec": round(in_cue_s, 3),
         "clip_sec": round(n / sr, 3),
         "preset": preset,
+        **({"diag": {"key_shift": key_shift}} if key_shift else {}),
     }
+
+
+def _pitch_glide(seg, sr, semis, glide_start_s, glide_s):
+    """Retune the OUTGOING side's continuation by `semis` semitones without a
+    pitch jump at the cut (fork, mixing round 2 — key-fix). Real DJs
+    transpose a clashing record by one semitone (2.5% of tracks in Kim et
+    al.'s 20k-transition study, 94% of those by exactly ±1); here the
+    pre-cut audio already aired at its true pitch, so the continuation GLIDES
+    from 0 to `semis` across `glide_s` — a pitch ride under the incoming
+    track's entry, landing harmonically locked before the two harmonies meet
+    at full level. rubberband 3 --pitchmap (realtime mode, so the length is
+    approximate — the caller re-fits it). Returns None on any failure; the
+    caller keeps the unshifted audio."""
+    import subprocess
+    import tempfile
+    import numpy as np
+    import soundfile as sf
+
+    if not semis:
+        return seg
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            src, dst, pm = (os.path.join(td, f) for f in ("in.wav", "out.wav", "pitch.map"))
+            sf.write(src, seg.astype(np.float32), sr, subtype="FLOAT")
+            steps = 24
+            a = int(max(0.0, glide_start_s) * sr)
+            with open(pm, "w") as f:
+                f.write(f"0 0\n")
+                for k in range(1, steps + 1):
+                    f.write(f"{a + int(k * glide_s * sr / steps)} {semis * k / steps:.4f}\n")
+            subprocess.run(
+                ["rubberband", "-3", "-q", "--pitchmap", pm, src, dst],
+                check=True, capture_output=True, timeout=60,
+            )
+            out, _sr = sf.read(dst, dtype="float32", always_2d=True)
+            return out
+    except Exception as e:  # noqa: BLE001 — a retune is an upgrade, never a blocker
+        log(f"render_transition: key-fix glide failed ({e}); keeping original pitch")
+        return None
+
+
+def _extend_grid(bars_s, *, until_s=None, from_s=None, max_cv=0.04):
+    """Extrapolate a bar grid (seconds) forward to `until_s` and/or backward
+    to `from_s` at its own median spacing (fork, mixing round 2 — long
+    blends). The analysis grids stop at the ANALYSIS windows, but the stem
+    cache may run longer (STEM_HEAD/TAIL_SECONDS): without this the extra
+    stem audio is unreachable. Only a tempo-stable grid extends (spacing CV
+    under `max_cv` across the edge's last eight bars) — on live-drummer
+    material an extrapolated downbeat is a guess, and the phase fits
+    downstream only correct a fraction of a beat."""
+    import numpy as np
+    b = list(bars_s)
+    if len(b) < 5:
+        return b
+    def spacing(seq):
+        sp = [y - x for x, y in zip(seq, seq[1:]) if 0.4 < (y - x) < 4.0]
+        if len(sp) < 4:
+            return None
+        sp = np.array(sp)
+        return float(np.median(sp)) if float(np.std(sp) / max(np.mean(sp), 1e-9)) <= max_cv else None
+    if until_s is not None:
+        sp = spacing(b[-9:])
+        if sp:
+            while b[-1] + sp <= until_s:
+                b.append(b[-1] + sp)
+    if from_s is not None:
+        sp = spacing(b[:9])
+        if sp:
+            while b[0] - sp >= from_s:
+                b.insert(0, b[0] - sp)
+    return b
 
 
 def render_transition(req):
@@ -1896,6 +1994,11 @@ def render_transition(req):
     # Drums are atonal, so a harmonic clash can ride it where a layered
     # preset would fight.
     echo_mode = req.get("preset") == "echo_out"
+    # Key-fix (fork, mixing round 2): semitones to retune the outgoing tonal
+    # stems by, gliding in after the cut — see _pitch_glide. The controller
+    # only asks when ±1 turns a clash into a Camelot-safe pair.
+    _ks = req.get("key_shift_semitones")
+    key_shift = int(_ks) if isinstance(_ks, (int, float)) and abs(int(_ks)) in (1, 2) else 0
     _loop_stretch_rate = None  # set if the borrowed loop gets tempo-locked
 
     def load_window(stems_dir, window):
@@ -1944,6 +2047,12 @@ def render_transition(req):
     # --- Outgoing side: the drum-loop source bar + the blend start --------
     outro = out_spec.get("outro") or {}
     out_bars = [b / 1000.0 for b in (outro.get("bars") or [])]
+    # Tail stems longer than the outro analysis window (STEM_TAIL_SECONDS):
+    # walk the measured outro grid back across them, so a club mix-out that
+    # lands before the outro window (extended mixes' long DJ outros) is
+    # finally reachable instead of ignored. Equal windows: no-op.
+    if dur_s - tail_start_s > OUTRO_SECONDS + 2.0 and out_bars:
+        out_bars = _extend_grid(out_bars, from_s=tail_start_s + 0.05)
     out_vox = [
         (float(r.get("start_ms", 0)) / 1000.0, float(r.get("end_ms", 0)) / 1000.0)
         for r in (outro.get("vocal_ranges") or [])
@@ -2122,7 +2231,14 @@ def render_transition(req):
     # extended-mix intros run 8-16 DJ-tool bars): match the incoming track's
     # measured structural intro, clamped 4..12 and to what the head window
     # can actually serve. Full-open tracks keep the classic 4.
-    _head_probe_bars = [b / 1000.0 for b in (in_spec.get("bars") or []) if 0.0 <= b / 1000.0 <= ANALYZE_SECONDS - 1.0]
+    # The head stems may run longer than the analysis window (STEM_HEAD_
+    # SECONDS); extend the measured grid across them so a long ride can reach
+    # that audio. With equal windows this is the analysis grid exactly.
+    _head_len_s = min(h.shape[0] for h in head.values()) / sr
+    _in_grid = [b / 1000.0 for b in (in_spec.get("bars") or []) if 0.0 <= b / 1000.0 <= ANALYZE_SECONDS - 1.0]
+    if _head_len_s > ANALYZE_SECONDS + 1.0:
+        _in_grid = _extend_grid(_in_grid, until_s=_head_len_s - 1.0)
+    _head_probe_bars = _in_grid
     _head_bounds = list(zip(_head_probe_bars, _head_probe_bars[1:]))
     _intro_bars = _structural_intro_bars(_melodic_ratio_per_bar(head, _head_bounds, sr)) if len(_head_bounds) >= 4 else 0
     # Pair-derived carry (mixing research 2026-09-10, Mixxx's rule: the
@@ -2159,7 +2275,7 @@ def render_transition(req):
     # more bars ≈ +4s of runway at house tempi, and the listener just hears
     # more of the track they were entering anyway.
     TAIL_FULL_BARS = 4
-    in_bars = [b / 1000.0 for b in (in_spec.get("bars") or []) if 0.0 <= b / 1000.0 <= ANALYZE_SECONDS - 1.0]
+    in_bars = list(_in_grid)
     if len(in_bars) < CARRY_BARS + TAIL_FULL_BARS + 1:
         # Dynamic carry over-asked (slow track: 17 bars won't fit the head
         # window) — shrink toward the classic 4 before giving up.
@@ -2250,6 +2366,7 @@ def render_transition(req):
                 allow_stretch=req.get("allow_stretch") is True,
                 out_dir=out_dir, clip_name=clip_name, out_vox=out_vox,
                 cut_ceiling_s=_cut_ceiling,
+                key_shift=key_shift,
             )
         except Exception as e:  # noqa: BLE001 — a broken preset must not kill the seam
             log(f"render_transition: preset '{preset}' failed ({e}); falling back to beat carry")
@@ -2377,11 +2494,94 @@ def render_transition(req):
     # loop survives only as the talk-hold bed and the sub-material fallback.
     loop_buf = np.zeros((n, 2), dtype=np.float32)
     loop_len = drum_loop.shape[0]
-    _cut_rel = blend_start_s - tail_start_s
-    _raw_need = int(n / (1.0 if _loop_stretch_rate is None else (1.0 / _loop_stretch_rate)))
+    _rate = 1.0 if _loop_stretch_rate is None else float(_loop_stretch_rate)
+    # DOWNBEAT ALIGNMENT (mixing round 2, 2026-10-23). The forward audio
+    # starts at the cut — an outgoing BAR boundary — at clip t=0, but the
+    # incoming head's first downbeat sits at in_bars[0] (library median
+    # 534ms, 75% of tracks >60ms off any beat). Unaligned, every dual-overlap
+    # carry ran the two grids that far apart: the `beats_off` tag. Same fix
+    # the layered presets use: open the clip `lead` early on the outgoing's
+    # own continuous audio, so its bar boundary lands ON the incoming
+    # downbeat. The listener never hears the cut move — the audio across it
+    # is unbroken either way.
+    _lead_raw = max(0.0, float(in_bars[0])) * _rate
+    _align_shift_raw = 0.0
+    if blend_start_s - _lead_raw >= tail_start_s + 0.05:
+        _align_shift_raw = _lead_raw
+    _cut_rel = (blend_start_s - _align_shift_raw) - tail_start_s
+    _raw_need = int(n * _rate)
     _avail = tail["drums"].shape[0] - int(_cut_rel * sr)
     _overlap_mode = _avail >= min(_raw_need, int((in_bars[min(_drum_entry + 2, _max_k)] ) * sr))
+    _diag = {}
     if _overlap_mode:
+        # Kick-onset phase fit. The grid alignment above is only as good as
+        # the librosa grids, and measured over the A/B pair set they are NOT
+        # beat-phase accurate: kick cross-correlation after grid alignment
+        # still peaked up to ~1/3 beat off (an audible flam / trainwreck).
+        # So the AUDIO decides the beat phase: correlate low-band (kick, <150
+        # Hz, drums stem only — an off-beat bassline lives in the bass stem
+        # and can't fool it) onset envelopes of the outgoing forward drums
+        # and the incoming head drums across the carry, over the full ±1/2
+        # beat range, and move the cut to the peak. Kicks repeat every beat,
+        # so any lag in that range resolves the beat phase; the grid still
+        # owns the bar phase. Weak evidence (no clear peak — sparse or broken
+        # beats) keeps the grid placement.
+        def _kick_env(x, a, b):
+            seg = to_stereo(x, x.shape[0])[a:b].mean(axis=1)
+            if seg.shape[0] < sr // 2:
+                return None
+            spec = np.fft.rfft(seg)
+            f = np.fft.rfftfreq(seg.shape[0], 1 / sr)
+            spec[f > 150.0] = 0
+            low = np.abs(np.fft.irfft(spec, n=seg.shape[0]))
+            hop = 256
+            env = low[: (low.shape[0] // hop) * hop].reshape(-1, hop).mean(axis=1)
+            d = np.diff(env, prepend=env[:1])
+            return np.maximum(d, 0.0)
+        try:
+            _bar1 = max(in_bars[1] - in_bars[0], 0.5)
+            _carry_end = min(in_bars[min(CARRY_BARS, _max_k)], n / sr)
+            _ia, _ib = int(in_bars[0] * sr), int(_carry_end * sr)
+            _ref = _kick_env(head["drums"], _ia, _ib)
+            _o0 = int(_cut_rel * sr)
+            _span_raw = int((_ib - _ia) * _rate)
+            _max_d = int((_bar1 / 8.0) * _rate * sr)
+            _out_seg = tail["drums"][max(0, _o0 + int(_ia * _rate) - _max_d): _o0 + int(_ia * _rate) + _span_raw + _max_d]
+            _oe = _kick_env(_out_seg, 0, _out_seg.shape[0])
+            if _ref is not None and _oe is not None and float(np.max(_ref)) > 1e-4 and float(np.max(_oe)) > 1e-4:
+                hop = 256
+                _ref_r = _ref
+                if abs(_rate - 1.0) > 1e-3:
+                    # Outgoing envelope is in RAW time — resample to clip time.
+                    _x = np.linspace(0, 1, _oe.shape[0])
+                    _oe = np.interp(np.linspace(0, 1, max(2, int(_oe.shape[0] / _rate))), _x, _oe)
+                _md = max(1, int(_max_d / _rate / hop))
+                L = min(_ref_r.shape[0], _oe.shape[0] - 2 * _md)
+                if L > 8:
+                    scores = [float(np.dot(_oe[_md + d: _md + d + L], _ref_r[:L])) for d in range(-_md, _md + 1)]
+                    best = int(np.argmax(scores)) - _md
+                    s0 = scores[_md]
+                    _diag["align_ms"] = round(best * hop / sr * 1000.0, 1)
+                    # Only move on a clear peak — a flat correlation (sparse
+                    # or broken-beat drums) is no evidence.
+                    _prom = scores[best + _md] / max(float(np.median(scores)), 1e-9)
+                    _diag["align_prom"] = round(_prom, 2)
+                    if best != 0 and _prom >= 1.25 and scores[best + _md] > 1.1 * max(s0, 1e-9):
+                        _nudge_raw = best * hop / sr * _rate
+                        if _cut_rel + _nudge_raw >= 0.05:
+                            _align_shift_raw -= _nudge_raw
+                            _cut_rel += _nudge_raw
+                            _diag["nudged_ms"] = _diag["align_ms"]
+                            _diag["align_ms"] = 0.0
+                            log(f"render_transition: kick-onset nudge {best * hop / sr * 1000.0:+.0f}ms")
+        except Exception as e:  # noqa: BLE001 — alignment is an upgrade, never a blocker
+            log(f"render_transition: kick refine skipped ({e})")
+        if _align_shift_raw:
+            log(f"render_transition: cut opened {_align_shift_raw * 1000:.0f}ms early — outgoing bar lands on the incoming downbeat")
+        blend_start_s = blend_start_s - _align_shift_raw
+        _diag["lead_ms"] = round(_align_shift_raw * 1000.0, 1)
+        if key_shift:
+            _diag["key_shift"] = key_shift
         def _fwd(name):
             i0 = int(_cut_rel * sr)
             seg = tail[name][i0:i0 + max(_raw_need, 1)]
@@ -2393,6 +2593,11 @@ def render_transition(req):
                     ).astype(np.float32)
                 except Exception:
                     pass
+            if key_shift and name in ("bass", "other", "vocals"):
+                g = _pitch_glide(to_stereo(seg, seg.shape[0]), sr, key_shift, 0.0,
+                                 max(0.5, in_bars[min(2, len(in_bars) - 1)]))
+                if g is not None:
+                    seg = g
             return to_stereo(seg, n)
         bar1 = max(in_bars[1] - in_bars[0], 0.5)
         def _env(points):
@@ -2637,6 +2842,7 @@ def render_transition(req):
         **({"talk_hold_sec": round(hold_sec_actual, 2)} if hold_sec_actual > 0 else {}),
         **({"preset": "echo_out"} if echo_mode else {}),
         "structural_cut": _structural_cut,
+        **({"diag": _diag} if _diag else {}),
     }
 
 
@@ -2851,11 +3057,21 @@ def analyze(
         if detector is not None:
             try:
                 ys, _srs = load_audio(
-                    librosa, path, sr=DEMUCS_SR, mono=False, duration=ANALYZE_SECONDS
+                    librosa, path, sr=DEMUCS_SR, mono=False,
+                    duration=STEM_HEAD_SECONDS if stems_dir else ANALYZE_SECONDS,
                 )
                 if ys is not None and np.size(ys) > 0:
                     head_stems = detector.separate(ys)
-                    vocal_ranges = detector.detect(ys, DEMUCS_SR, librosa, stems=head_stems)
+                    # Vocal ranges stay an ANALYSIS-window measurement even when
+                    # the stem window runs longer (see STEM_HEAD_SECONDS).
+                    _na = int(ANALYZE_SECONDS * DEMUCS_SR)
+                    if ys.shape[-1] > _na:
+                        vocal_ranges = detector.detect(
+                            ys[..., :_na], DEMUCS_SR, librosa,
+                            stems={k: v[..., :_na] for k, v in head_stems.items()},
+                        )
+                    else:
+                        vocal_ranges = detector.detect(ys, DEMUCS_SR, librosa, stems=head_stems)
                     if stems_dir:
                         try:
                             write_stems(head_stems, "head", stems_dir)
@@ -2878,19 +3094,29 @@ def analyze(
         if detector is not None and outro is not None and "startMs" in outro:
             try:
                 tail_offset = max(0.0, duration_s - OUTRO_SECONDS)
+                # The stem window may start earlier (STEM_TAIL_SECONDS); the
+                # vocal detection below always reads the analysis-window slice.
+                stem_tail_offset = max(0.0, duration_s - STEM_TAIL_SECONDS) if stems_dir else tail_offset
                 y_tail, _srt = load_audio(
                     librosa, path, sr=DEMUCS_SR, mono=False,
-                    offset=tail_offset, duration=OUTRO_SECONDS,
+                    offset=stem_tail_offset, duration=duration_s - stem_tail_offset if stems_dir else OUTRO_SECONDS,
                 )
                 if y_tail is not None and np.size(y_tail) > 0:
                     tail_stems = detector.separate(y_tail)
-                    tail_vocals = detector.detect(
-                        y_tail, DEMUCS_SR, librosa, min_loud=TAIL_VOCAL_MIN_LOUD, stems=tail_stems
-                    )
+                    _skip = int(round((tail_offset - stem_tail_offset) * DEMUCS_SR))
+                    if _skip > 0 and y_tail.shape[-1] > _skip:
+                        tail_vocals = detector.detect(
+                            y_tail[..., _skip:], DEMUCS_SR, librosa, min_loud=TAIL_VOCAL_MIN_LOUD,
+                            stems={k: v[..., _skip:] for k, v in tail_stems.items()},
+                        )
+                    else:
+                        tail_vocals = detector.detect(
+                            y_tail, DEMUCS_SR, librosa, min_loud=TAIL_VOCAL_MIN_LOUD, stems=tail_stems
+                        )
                     if stems_dir:
                         try:
                             write_stems(tail_stems, "tail", stems_dir)
-                            write_tail_meta(stems_dir, tail_offset, duration_s)
+                            write_tail_meta(stems_dir, stem_tail_offset, duration_s)
                         except Exception as e:  # noqa: BLE001 — cache is best-effort
                             log(f"stem cache write (tail) failed: {e}")
                     shift_ms = tail_offset * 1000.0

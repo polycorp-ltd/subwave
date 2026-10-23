@@ -965,6 +965,9 @@ export interface RenderTransitionPayload {
   // data vote. Absent = the v1 beat carry; old workers ignore the key and
   // render the beat carry either way, so the wire stays back-compatible.
   preset?: string;
+  // Key-fix (fork): retune the outgoing tonal stems by this many semitones,
+  // gliding in after the cut. Old workers ignore it and render unshifted.
+  key_shift_semitones?: number;
 }
 
 export interface RenderTransitionResult {

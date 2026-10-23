@@ -145,7 +145,9 @@ export async function maybeRenderBlend(
   {
     const outKeyEnd = mix.endingKeyFrom(out.keyRanges, out.durationSec ? out.durationSec * 1000 : null, out.musicalKey);
     const inKeyStart = mix.openingKeyFrom(inn.keyRanges, inn.musicalKey);
-    if (outKeyEnd && inKeyStart && mix.keyCompat(outKeyEnd, inKeyStart) === 0) {
+    if (outKeyEnd && inKeyStart && mix.keyCompat(outKeyEnd, inKeyStart) === 0
+      // A seam the key-fix can retune is not a clash (fork, mixing round 2).
+      && !(config.mixing.keyFix && mix.keyFixSemitones(outKeyEnd, inKeyStart) !== 0)) {
       // Clash seams no longer decline (field reports 2026-09-06/07: the
       // harmonic floor starved blends — 39/49 declines — and the surviving
       // plain washes read as "sub/wave's normal crossfade"). A tempo-eligible
@@ -196,15 +198,18 @@ export async function maybeRenderBlend(
   // ending → bass swap; else the shipped beat carry. An old worker ignores the
   // preset key entirely and renders the beat carry it knows.
   const outDurMs = out.durationSec ? out.durationSec * 1000 : null;
-  const seamKeyCompat = mix.keyCompat(
-    mix.endingKeyFrom(out.keyRanges, outDurMs, out.musicalKey),
-    mix.openingKeyFrom(inn.keyRanges, inn.musicalKey),
-  );
+  const seamOutKey = mix.endingKeyFrom(out.keyRanges, outDurMs, out.musicalKey);
+  const seamInKey = mix.openingKeyFrom(inn.keyRanges, inn.musicalKey);
+  // Key-fix (fork, mixing round 2): a ±1 semitone retune of the outgoing
+  // side that makes the seam Camelot-safe; the vote then sees the retuned
+  // compatibility (so a fixable pair earns the harmonic presets and the bass
+  // baton instead of echo_out).
+  const keyShift = config.mixing.keyFix ? mix.keyFixSemitones(seamOutKey, seamInKey) : 0;
+  const seamKeyCompat = keyShift
+    ? mix.keyCompat(mix.transposeCamelot(seamOutKey, keyShift), seamInKey)
+    : mix.keyCompat(seamOutKey, seamInKey);
   const preset = mix.choosePreset({
-    keyCompat: mix.keyCompat(
-      mix.endingKeyFrom(out.keyRanges, outDurMs, out.musicalKey),
-      mix.openingKeyFrom(inn.keyRanges, inn.musicalKey),
-    ),
+    keyCompat: seamKeyCompat,
     tempoLocked: stretchRatio != null && (Math.abs(stretchRatio - 1) <= mix.LAYERED_LOCK_RATIO || stretchOk),
     outEnding: out.outro.ending === 'fade' || out.outro.ending === 'cold' ? out.outro.ending : null,
     outVocalTail: mix.vocalTailFor(out.outro.vocalRanges, out.outro.startMs),
@@ -293,6 +298,7 @@ export async function maybeRenderBlend(
     // through the seam when the boundary keys agree.
     ...(seamKeyCompat >= 0.8 ? { bass_carry_ok: true } : {}),
     ...(chosenPreset !== 'beat_carry' ? { preset: chosenPreset } : {}),
+    ...(keyShift ? { key_shift_semitones: keyShift } : {}),
   }, { timeoutMs });
   if (!result) return decline('render returned null (worker/timeout)');
 
@@ -321,6 +327,7 @@ export async function maybeRenderBlend(
       stretchRatio: stretchRatio ?? null,
       stretched: allowStretch,
       keyCompat: seamKeyCompat,
+      keyShift,
       mildClash,
       tempoClash,
       votedPreset: preset,

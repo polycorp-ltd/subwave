@@ -528,6 +528,7 @@ class RenderTransitionRequest(BaseModel):
     bass_carry_ok: bool | None = None
     talk_hold_sec: float | None = None
     preset: str | None = None
+    key_shift_semitones: int | None = None
 
     model_config = {"populate_by_name": True}
 
@@ -549,7 +550,7 @@ async def render_transition(req: RenderTransitionRequest):
         payload["clip_name"] = req.clip_name
     if req.target_lufs is not None:
         payload["target_lufs"] = req.target_lufs
-    for k in ("allow_stretch", "bass_carry_ok", "talk_hold_sec", "preset"):
+    for k in ("allow_stretch", "bass_carry_ok", "talk_hold_sec", "preset", "key_shift_semitones"):
         v = getattr(req, k)
         if v is not None:
             payload[k] = v

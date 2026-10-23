@@ -119,6 +119,10 @@ export const config = {
     // Mini-runs follow the hour's set arc (broadcast/set-arc.ts): Camelot +1
     // per pick to lift, -1 to release. 'off' = the legacy fixed ±6 BPM run.
     setArc: envEnum('SET_ARC', ['on', 'off'] as const, 'on') === 'on',
+    // ±1 semitone retune of the outgoing side when it makes a clashing seam
+    // Camelot-safe (mix.keyFixSemitones, worker _pitch_glide). Off until the
+    // Mix Lab ears sign off on the glide.
+    keyFix: envEnum('KEY_FIX', ['on', 'off'] as const, 'off') === 'on',
   },
   kokoro: {
     python: envStr('KOKORO_PYTHON', '/opt/kokoro/venv/bin/python'),
