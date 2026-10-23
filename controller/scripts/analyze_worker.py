@@ -161,7 +161,15 @@ BEAT_THIS_ON = os.environ.get("ANALYZE_BEAT_THIS", "").strip().lower() not in ("
 # drifting live drummer or a half-time breakdown blows past it and keeps
 # librosa (whose local beats at least follow the drift).
 BEAT_THIS_FIT_P90_S = 0.030
-BEAT_THIS_GRID_VERSION = 1
+# v2: the cache also keeps the raw (unfitted) beats, for the beat warp.
+BEAT_THIS_GRID_VERSION = 2
+# Per-beat warp (fork, mixing round 2 — item 5c): layered rides and beat
+# carries stretch the outgoing stems through a rubberband --timemap pinned
+# beat-for-beat to the incoming's own Beat This! beats, instead of one
+# constant ratio. Off: the constant stretch (and the carry's kick nudge).
+BEAT_WARP_ON = os.environ.get("ANALYZE_BEAT_WARP", "").strip().lower() not in ("0", "off", "false", "no")
+# A constant map already landing 90% of beats within this needs no warp.
+BEAT_WARP_TIGHT_S = 0.012
 
 
 # Vocal-stem gate thresholds (issue #1125). The stem is thresholded against BOTH
@@ -1683,7 +1691,8 @@ _LAYERED_LOCK_RATIO = 0.008
 
 def _render_layered(preset, tail, head, *, tail_start_s, dur_s, sr, out_bars,
                     wind_down_s, in_bars, g_in, g_out, allow_stretch,
-                    out_dir, clip_name, out_vox=(), cut_ceiling_s=None, key_shift=0):
+                    out_dir, clip_name, out_vox=(), cut_ceiling_s=None, key_shift=0,
+                    out_beats=None, in_beats=None):
     """Render one layered preset, or None when its constraints can't be met
     (caller falls back to the beat carry). All times in seconds; out_bars /
     in_bars already converted from the stored ms grids."""
@@ -1814,10 +1823,40 @@ def _render_layered(preset, tail, head, *, tail_start_s, dur_s, sr, out_bars,
     in_pts = spec["in"](bt)
     stem_names = ("drums", "bass", "other", "vocals")
 
+    # Per-beat warp (BEAT_WARP_ON): one map for all four stems, so they stay
+    # locked to each other while the whole outgoing side follows the
+    # incoming drummer. Any failure keeps the constant stretch.
+    tmap, warp = None, None
+    if out_beats and in_beats and importlib.util.find_spec("pyrubberband") is not None \
+            and shutil.which("rubberband") is not None:
+        tmap, warp = _beat_timemap(
+            out_beats, in_beats, src0_s=b0 - lead_raw, anchor_out_s=b0, anchor_in_s=bt[0],
+            ratio=s_ratio, raw_n=raw_n, n=n, sr=sr,
+            applied_ratio=s_ratio if stretch_needed else 1.0,
+        )
+        if tmap:
+            log(f"render_transition[{preset}]: beat warp over {warp['pairs']} beats "
+                f"(constant map p90 {warp['p90_ms']}ms, max {warp['max_ms']}ms)")
+        else:
+            log(f"render_transition[{preset}]: beat warp skipped ({warp})")
+
     out_buf = np.zeros((n, 2), dtype=np.float32)
     for name in stem_names:
         seg = _stereo_n(tail[name][i0:i0 + raw_n], raw_n)
-        if stretch_needed:
+        if tmap:
+            import pyrubberband
+
+            try:
+                seg = pyrubberband.timemap_stretch(seg.astype(np.float64), sr, tmap).astype(np.float32)
+            except Exception as e:  # noqa: BLE001 — drop to the constant stretch for every stem
+                log(f"render_transition[{preset}]: beat warp failed ({e}); constant stretch")
+                return _render_layered(
+                    preset, tail, head, tail_start_s=tail_start_s, dur_s=dur_s, sr=sr,
+                    out_bars=out_bars, wind_down_s=wind_down_s, in_bars=in_bars, g_in=g_in,
+                    g_out=g_out, allow_stretch=allow_stretch, out_dir=out_dir, clip_name=clip_name,
+                    out_vox=out_vox, cut_ceiling_s=cut_ceiling_s, key_shift=key_shift,
+                )
+        elif stretch_needed:
             import pyrubberband
 
             seg = pyrubberband.time_stretch(
@@ -1893,7 +1932,10 @@ def _render_layered(preset, tail, head, *, tail_start_s, dur_s, sr, out_bars,
         "in_cue_sec": round(in_cue_s, 3),
         "clip_sec": round(n / sr, 3),
         "preset": preset,
-        **({"diag": {"key_shift": key_shift}} if key_shift else {}),
+        "diag": {
+            **({"key_shift": key_shift} if key_shift else {}),
+            **({"warp": warp if tmap else {"skip": warp}} if warp else {}),
+        },
     }
 
 
@@ -2019,12 +2061,14 @@ def _bt_bar_grid(stems, sr, offset_s, stems_dir=None, part=None, ref_bars=None):
         return None, None
     info = {}
     rel = None
+    beats_rel = None
     try:
         n = min(s.shape[0] for s in stems.values())
         mix = sum(s[:n].mean(axis=1) for s in stems.values()).astype(np.float32)
         beats, downs = a2b(mix, sr)
         beats = np.asarray(beats, dtype=float)
         downs = np.asarray(downs, dtype=float)
+        beats_rel = [round(float(b), 4) for b in beats]
         if len(beats) < 16:
             info = {"why": "few-beats", "n": int(len(beats))}
         else:
@@ -2063,11 +2107,102 @@ def _bt_bar_grid(stems, sr, offset_s, stems_dir=None, part=None, ref_bars=None):
         try:
             tmp = cache_path + ".tmp"
             with open(tmp, "w") as f:
-                json.dump({"v": BEAT_THIS_GRID_VERSION, "mtime": drums_mtime, "bars_rel": rel, "info": info}, f)
+                json.dump({"v": BEAT_THIS_GRID_VERSION, "mtime": drums_mtime, "bars_rel": rel,
+                           "beats_rel": beats_rel, "info": info}, f)
             os.replace(tmp, cache_path)
         except OSError:
             pass
     return _checked(rel, info)
+
+
+def _bt_beats(stems_dir, part, offset_s):
+    """The raw Beat This! beats (absolute seconds) _bt_bar_grid cached for a
+    stem window, or None. Raw, not fitted: the warp exists for the beats a
+    constant grid can't hold. Same gate as the grid cache."""
+    if not BEAT_THIS_ON or not BEAT_WARP_ON or not stems_dir or not os.path.exists(BEAT_THIS_WEIGHTS):
+        return None
+    try:
+        with open(os.path.join(stems_dir, f"bt-grid-{part}.json")) as f:
+            c = json.load(f)
+        if c.get("v") != BEAT_THIS_GRID_VERSION or c.get("mtime") != os.path.getmtime(
+            os.path.join(stems_dir, f"{part}-drums.flac")
+        ):
+            return None
+        b = c.get("beats_rel")
+        return [offset_s + float(x) for x in b] if b else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _beat_timemap(out_beats, in_beats, *, src0_s, anchor_out_s, anchor_in_s, ratio, raw_n, n, sr,
+                  applied_ratio=None, cover_until_s=None):
+    """A rubberband --timemap (sample-frame pairs) that lands each outgoing
+    beat ON the matching incoming beat, or (None, why) to keep the constant
+    stretch. `src0_s` is where the outgoing slice starts (absolute), the two
+    anchors are the downbeats the constant map already pairs (the cut bar ↔
+    the incoming bar the ride opens on), `ratio` is clip-time per source
+    second (in_bar / out_bar); `applied_ratio` is what the render would
+    otherwise apply (1.0 under the layered lock tolerance, where an 0.8%
+    mismatch drifts ~250ms over a 16-bar ride) — the bar the warp must beat.
+    `cover_until_s` (clip time) is where the outgoing side stops mattering —
+    a beat carry's forward audio is enveloped out long before the clip ends.
+
+    Beats pair by COUNT from the anchors, so a missed or doubled beat on
+    either side would shear everything after it: pairing stops at the first
+    interval off `ratio` by more than 30% — a skipped or doubled beat reads
+    ~2x or ~0.5x, while a live drummer's push and pull stays well inside
+    (a 12% bound broke on one sloppy beat of a ±15ms player) — and the map is
+    only used when it still covers 3/4 of the ride. Every warp segment stays
+    within ±15% of `ratio` — the map corrects phase, it never re-tempos."""
+    import numpy as np
+    if not out_beats or not in_beats:
+        return None, "no-beats"
+    ob = np.asarray(out_beats, float) - src0_s
+    ib = np.asarray(in_beats, float)
+    a_o = anchor_out_s - src0_s
+    io = int(np.argmin(np.abs(ob - a_o)))
+    ii = int(np.argmin(np.abs(ib - anchor_in_s)))
+    if abs(ob[io] - a_o) > 0.07 or abs(ib[ii] - anchor_in_s) > 0.07:
+        return None, "anchor"
+    raw_s, clip_s = raw_n / sr, n / sr
+    pairs = []
+    k = 0
+    while io + k < len(ob) and ii + k < len(ib):
+        s, t = float(ob[io + k]), float(ib[ii + k])
+        if s >= raw_s - 0.05 or t >= clip_s - 0.05:
+            break
+        if pairs:
+            ds, dt = s - pairs[-1][0], t - pairs[-1][1]
+            if ds <= 0 or dt <= 0 or abs((dt / ds) / ratio - 1.0) > 0.3:
+                break
+        pairs.append((s, t))
+        k += 1
+    cover_s = clip_s if cover_until_s is None else min(clip_s, cover_until_s)
+    if len(pairs) < 8 or (pairs[-1][1] - pairs[0][1]) < 0.75 * (cover_s - pairs[0][1]):
+        return None, "coverage"
+    ar = ratio if applied_ratio is None else applied_ratio
+    resid = np.array([t - s * ar for s, t in pairs])
+    p90 = float(np.percentile(np.abs(resid), 90))
+    if p90 <= BEAT_WARP_TIGHT_S:
+        return None, f"tight ({p90 * 1000:.0f}ms)"
+
+    def ok(a, b):
+        ds, dt = b[0] - a[0], b[1] - a[1]
+        return ds > 0 and dt > 0 and abs((dt / ds) / ratio - 1.0) <= 0.15
+
+    pts = [(0.0, 0.0)]
+    for p in pairs:
+        if p[0] > 0.0 and ok(pts[-1], p):
+            pts.append(p)
+    end = (raw_s, clip_s)
+    while len(pts) > 1 and not ok(pts[-1], end):
+        pts.pop()
+    if len(pts) < 8:
+        return None, "segments"
+    frames = [(int(round(s * sr)), int(round(t * sr))) for s, t in pts[1:]]
+    frames = [(0, 0)] + [f for f in frames if 0 < f[0] < raw_n and 0 < f[1] < n] + [(int(raw_n), int(n))]
+    return frames, {"pairs": len(frames) - 2, "p90_ms": round(p90 * 1000.0, 1),
+                    "max_ms": round(float(np.max(np.abs(resid))) * 1000.0, 1)}
 
 
 def _extend_grid(bars_s, *, until_s=None, from_s=None, max_cv=0.04):
@@ -2539,11 +2674,14 @@ def render_transition(req):
                 out_dir=out_dir, clip_name=clip_name, out_vox=out_vox,
                 cut_ceiling_s=_cut_ceiling,
                 key_shift=key_shift,
+                out_beats=_bt_beats(out_spec["stems_dir"], "tail", tail_start_s),
+                in_beats=_bt_beats(in_spec["stems_dir"], "head", 0.0),
             )
         except Exception as e:  # noqa: BLE001 — a broken preset must not kill the seam
             log(f"render_transition: preset '{preset}' failed ({e}); falling back to beat carry")
             layered = None
         if layered is not None:
+            layered["diag"] = {**_grid_diag, **(layered.get("diag") or {})}
             return layered
         log(f"render_transition: preset '{preset}' constraints unmet; beat carry fallback")
 
@@ -2685,6 +2823,49 @@ def render_transition(req):
     _avail = tail["drums"].shape[0] - int(_cut_rel * sr)
     _overlap_mode = _avail >= min(_raw_need, int((in_bars[min(_drum_entry + 2, _max_k)] ) * sr))
     _diag = dict(_grid_diag)
+    # Per-beat warp (see _beat_timemap) of the forward audio onto the
+    # incoming beats; supersedes the kick-onset nudge. The tempo ratio comes
+    # from the beats themselves (median beat spacing each side), not the
+    # library BPMs the controller's allow_stretch is decided on: measured on
+    # the A/B set, pairs the library calls matched sat 1.5-2.5% apart on
+    # their actual beats — unstretched, ~0.5s of drift over a 16-bar carry,
+    # which a start-phase nudge can't fix. Without allow_stretch the warp
+    # still closes gaps up to 3% (clean territory for rubberband); past that
+    # the library is more wrong than a warp should paper over.
+    _tmap = None
+    _in_bar_s = (in_bars[CARRY_BARS] - in_bars[0]) / CARRY_BARS
+    _ob = _bt_beats(out_spec["stems_dir"], "tail", tail_start_s)
+    _ib = _bt_beats(in_spec["stems_dir"], "head", 0.0)
+    _true_ratio = 0.0
+    if _ob and _ib and _in_bar_s > 0:
+        _cover_s = in_bars[min(_drum_entry, _max_k)] + _in_bar_s
+        _oi = np.diff([b for b in _ob if blend_start_s - 0.1 <= b <= blend_start_s + _cover_s * _rate])
+        _ii = np.diff([b for b in _ib if in_bars[0] - 0.1 <= b <= _cover_s])
+        if len(_oi) >= 8 and len(_ii) >= 8:
+            _true_ratio = float(np.median(_ii)) / float(np.median(_oi))
+    if not _true_ratio or importlib.util.find_spec("pyrubberband") is None or shutil.which("rubberband") is None:
+        pass
+    elif not _overlap_mode:
+        _diag["warp"] = {"skip": "short"}
+    elif _loop_stretch_rate is None and abs(_true_ratio - 1.0) > 0.03:
+        _diag["warp"] = {"skip": "unstretched", "ratio": round(_true_ratio, 4)}
+    else:
+        # The clip can outlast the tail window (the full-mix bars after the
+        # drop); the forward audio only has to reach its own envelope's end,
+        # so the map spans what the window holds.
+        _warp_raw = min(_raw_need, _avail)
+        _tmap, _warp = _beat_timemap(
+            _ob, _ib, src0_s=tail_start_s + _cut_rel, anchor_out_s=blend_start_s, anchor_in_s=in_bars[0],
+            ratio=_true_ratio, raw_n=_warp_raw, n=min(n, int(_warp_raw / _rate)), sr=sr,
+            applied_ratio=1.0 / _rate, cover_until_s=_cover_s,
+        )
+        if _tmap:
+            _diag["warp"] = _warp
+            log(f"render_transition: beat warp over {_warp['pairs']} beats "
+                f"(constant map p90 {_warp['p90_ms']}ms, max {_warp['max_ms']}ms)")
+        else:
+            _diag["warp"] = {"skip": _warp}
+            log(f"render_transition: beat warp skipped ({_warp})")
     if _overlap_mode:
         # Kick-onset phase fit. The grid alignment above is only as good as
         # the librosa grids, and measured over the A/B pair set they are NOT
@@ -2710,44 +2891,45 @@ def render_transition(req):
             env = low[: (low.shape[0] // hop) * hop].reshape(-1, hop).mean(axis=1)
             d = np.diff(env, prepend=env[:1])
             return np.maximum(d, 0.0)
-        try:
-            _bar1 = max(in_bars[1] - in_bars[0], 0.5)
-            _carry_end = min(in_bars[min(CARRY_BARS, _max_k)], n / sr)
-            _ia, _ib = int(in_bars[0] * sr), int(_carry_end * sr)
-            _ref = _kick_env(head["drums"], _ia, _ib)
-            _o0 = int(_cut_rel * sr)
-            _span_raw = int((_ib - _ia) * _rate)
-            _max_d = int((_bar1 / 8.0) * _rate * sr)
-            _out_seg = tail["drums"][max(0, _o0 + int(_ia * _rate) - _max_d): _o0 + int(_ia * _rate) + _span_raw + _max_d]
-            _oe = _kick_env(_out_seg, 0, _out_seg.shape[0])
-            if _ref is not None and _oe is not None and float(np.max(_ref)) > 1e-4 and float(np.max(_oe)) > 1e-4:
-                hop = 256
-                _ref_r = _ref
-                if abs(_rate - 1.0) > 1e-3:
-                    # Outgoing envelope is in RAW time — resample to clip time.
-                    _x = np.linspace(0, 1, _oe.shape[0])
-                    _oe = np.interp(np.linspace(0, 1, max(2, int(_oe.shape[0] / _rate))), _x, _oe)
-                _md = max(1, int(_max_d / _rate / hop))
-                L = min(_ref_r.shape[0], _oe.shape[0] - 2 * _md)
-                if L > 8:
-                    scores = [float(np.dot(_oe[_md + d: _md + d + L], _ref_r[:L])) for d in range(-_md, _md + 1)]
-                    best = int(np.argmax(scores)) - _md
-                    s0 = scores[_md]
-                    _diag["align_ms"] = round(best * hop / sr * 1000.0, 1)
-                    # Only move on a clear peak — a flat correlation (sparse
-                    # or broken-beat drums) is no evidence.
-                    _prom = scores[best + _md] / max(float(np.median(scores)), 1e-9)
-                    _diag["align_prom"] = round(_prom, 2)
-                    if best != 0 and _prom >= 1.25 and scores[best + _md] > 1.1 * max(s0, 1e-9):
-                        _nudge_raw = best * hop / sr * _rate
-                        if _cut_rel + _nudge_raw >= 0.05:
-                            _align_shift_raw -= _nudge_raw
-                            _cut_rel += _nudge_raw
-                            _diag["nudged_ms"] = _diag["align_ms"]
-                            _diag["align_ms"] = 0.0
-                            log(f"render_transition: kick-onset nudge {best * hop / sr * 1000.0:+.0f}ms")
-        except Exception as e:  # noqa: BLE001 — alignment is an upgrade, never a blocker
-            log(f"render_transition: kick refine skipped ({e})")
+        if _tmap is None:  # the beat warp already pins every beat
+            try:
+                _bar1 = max(in_bars[1] - in_bars[0], 0.5)
+                _carry_end = min(in_bars[min(CARRY_BARS, _max_k)], n / sr)
+                _ia, _ib = int(in_bars[0] * sr), int(_carry_end * sr)
+                _ref = _kick_env(head["drums"], _ia, _ib)
+                _o0 = int(_cut_rel * sr)
+                _span_raw = int((_ib - _ia) * _rate)
+                _max_d = int((_bar1 / 8.0) * _rate * sr)
+                _out_seg = tail["drums"][max(0, _o0 + int(_ia * _rate) - _max_d): _o0 + int(_ia * _rate) + _span_raw + _max_d]
+                _oe = _kick_env(_out_seg, 0, _out_seg.shape[0])
+                if _ref is not None and _oe is not None and float(np.max(_ref)) > 1e-4 and float(np.max(_oe)) > 1e-4:
+                    hop = 256
+                    _ref_r = _ref
+                    if abs(_rate - 1.0) > 1e-3:
+                        # Outgoing envelope is in RAW time — resample to clip time.
+                        _x = np.linspace(0, 1, _oe.shape[0])
+                        _oe = np.interp(np.linspace(0, 1, max(2, int(_oe.shape[0] / _rate))), _x, _oe)
+                    _md = max(1, int(_max_d / _rate / hop))
+                    L = min(_ref_r.shape[0], _oe.shape[0] - 2 * _md)
+                    if L > 8:
+                        scores = [float(np.dot(_oe[_md + d: _md + d + L], _ref_r[:L])) for d in range(-_md, _md + 1)]
+                        best = int(np.argmax(scores)) - _md
+                        s0 = scores[_md]
+                        _diag["align_ms"] = round(best * hop / sr * 1000.0, 1)
+                        # Only move on a clear peak — a flat correlation (sparse
+                        # or broken-beat drums) is no evidence.
+                        _prom = scores[best + _md] / max(float(np.median(scores)), 1e-9)
+                        _diag["align_prom"] = round(_prom, 2)
+                        if best != 0 and _prom >= 1.25 and scores[best + _md] > 1.1 * max(s0, 1e-9):
+                            _nudge_raw = best * hop / sr * _rate
+                            if _cut_rel + _nudge_raw >= 0.05:
+                                _align_shift_raw -= _nudge_raw
+                                _cut_rel += _nudge_raw
+                                _diag["nudged_ms"] = _diag["align_ms"]
+                                _diag["align_ms"] = 0.0
+                                log(f"render_transition: kick-onset nudge {best * hop / sr * 1000.0:+.0f}ms")
+            except Exception as e:  # noqa: BLE001 — alignment is an upgrade, never a blocker
+                log(f"render_transition: kick refine skipped ({e})")
         if _align_shift_raw:
             log(f"render_transition: cut opened {_align_shift_raw * 1000:.0f}ms early — outgoing bar lands on the incoming downbeat")
         blend_start_s = blend_start_s - _align_shift_raw
@@ -2757,7 +2939,16 @@ def render_transition(req):
         def _fwd(name):
             i0 = int(_cut_rel * sr)
             seg = tail[name][i0:i0 + max(_raw_need, 1)]
-            if _loop_stretch_rate is not None:
+            if _tmap is not None and seg.shape[0] >= _tmap[-1][0]:
+                seg = seg[:_tmap[-1][0]]
+                try:
+                    import pyrubberband
+                    seg = pyrubberband.timemap_stretch(
+                        to_stereo(seg, seg.shape[0]).astype(np.float64), sr, _tmap
+                    ).astype(np.float32)
+                except Exception as e:  # noqa: BLE001 — the unwarped forward audio still plays
+                    log(f"render_transition: beat warp failed on {name} ({e})")
+            elif _loop_stretch_rate is not None:
                 try:
                     import pyrubberband
                     seg = pyrubberband.time_stretch(
@@ -2812,6 +3003,31 @@ def render_transition(req):
             g[:, 0] = np.convolve(g[:, 0], np.ones(k, np.float32) / k, mode="same")
             return g, (dead / held if held else 0.0), max_g
         d_sig = _fwd("drums")
+        # Sync diagnostic: per-beat kick-onset lag, outgoing forward drums vs
+        # incoming head drums, over the bars both are audible — what the warp
+        # (or the nudge) actually achieved, on the audio rather than a grid.
+        try:
+            _beat = _in_bar_s / 4.0
+            _he = _kick_env(head["drums"], 0, n)
+            _de = _kick_env(d_sig, 0, n)
+            if _beat > 0.2 and _he is not None and _de is not None:
+                hop, _w = 256, int(_beat * sr / 256)
+                _md = max(1, _w // 4)
+                _lags = []
+                t = in_bars[0]
+                while t + _beat < min(in_bars[min(_drum_entry, _max_k)] + _in_bar_s, n / sr):
+                    a0 = int(t * sr / hop)
+                    r = _he[a0:a0 + _w]
+                    if a0 - _md >= 0 and a0 + _w + _md <= _de.shape[0] and r.shape[0] == _w and float(np.max(r)) > 1e-4:
+                        sc = [float(np.dot(_de[a0 + d:a0 + d + _w], r)) for d in range(-_md, _md + 1)]
+                        if max(sc) > 1e-9:
+                            _lags.append(abs(int(np.argmax(sc)) - _md) * hop / sr * 1000.0)
+                    t += _beat
+                if len(_lags) >= 8:
+                    _diag["sync_p50_ms"] = round(float(np.median(_lags)), 1)
+                    _diag["sync_p90_ms"] = round(float(np.percentile(_lags, 90)), 1)
+        except Exception as e:  # noqa: BLE001 — diagnostic only
+            log(f"render_transition: sync diag skipped ({e})")
         d_gain, d_dead, d_max = _energy_hold(d_sig, de)
         d_env = _env([(0.0, 1.0), (de, 0.7), (de + bar1, 0.0)])
         if d_dead > 0.5:
