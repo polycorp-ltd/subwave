@@ -143,6 +143,26 @@ def _env_float(name, default):
 STEM_HEAD_SECONDS = max(ANALYZE_SECONDS, _env_float("ANALYZE_STEM_HEAD_SECONDS", ANALYZE_SECONDS))
 STEM_TAIL_SECONDS = max(OUTRO_SECONDS, _env_float("ANALYZE_STEM_TAIL_SECONDS", OUTRO_SECONDS))
 
+# Beat This! render grids (fork, mixing round 2 — item 5). librosa's grid,
+# measured against the drum stem's kicks on the long-window test set, sits
+# ~20-30ms behind the beat, makes octave errors (a 120 BPM track gridded at
+# 60) and its "bars" are just every 4th beat from wherever beat_track
+# started — no downbeat at all. Beat This! (Foscarin et al., ISMIR 2024)
+# lands ~5-10ms from the kick and predicts downbeats. Used at RENDER time on
+# the cached stem windows, so no library re-analysis; any failure (lean
+# image, weights absent, a loose fit on live-played material) keeps the
+# librosa grid exactly as before. The weights are the heavy image's baked
+# final0 checkpoint (safetensors — never a pickle); ANALYZE_BEAT_THIS=0 is
+# the kill switch.
+BEAT_THIS_WEIGHTS = os.environ.get("BEAT_THIS_WEIGHTS", "").strip() or "/opt/analyzer/beat_this/final0.safetensors"
+BEAT_THIS_ON = os.environ.get("ANALYZE_BEAT_THIS", "").strip().lower() not in ("0", "off", "false", "no")
+# A rigid (constant-tempo) fit through the predicted beats must hold every
+# beat but the worst 10% within this — electronic material sits at ~10ms; a
+# drifting live drummer or a half-time breakdown blows past it and keeps
+# librosa (whose local beats at least follow the drift).
+BEAT_THIS_FIT_P90_S = 0.030
+BEAT_THIS_GRID_VERSION = 1
+
 
 # Vocal-stem gate thresholds (issue #1125). The stem is thresholded against BOTH
 # its own loud level (self-relative, catches quiet-but-present vocals) AND a
@@ -1916,6 +1936,140 @@ def _pitch_glide(seg, sr, semis, glide_start_s, glide_s):
         return None
 
 
+_bt_model = None
+_bt_failed = False
+
+
+def _bt_load():
+    """The Beat This! tracker, loaded once; None when unavailable (logged
+    once). safetensors stores tied tensors once — the 11 shared rotary
+    frequency tables ride as aliases in the file's metadata and are restored
+    before the strict load."""
+    global _bt_model, _bt_failed
+    if _bt_model is not None or _bt_failed:
+        return _bt_model
+    if not BEAT_THIS_ON or not os.path.exists(BEAT_THIS_WEIGHTS):
+        _bt_failed = True
+        return None
+    try:
+        from safetensors import safe_open
+        from safetensors.torch import load_file
+        from beat_this.inference import Audio2Beats
+
+        a2b = Audio2Beats(checkpoint_path=None, device=resolve_device())
+        sd = load_file(BEAT_THIS_WEIGHTS)
+        with safe_open(BEAT_THIS_WEIGHTS, "pt") as f:
+            for k, src in (f.metadata() or {}).items():
+                if src in sd:
+                    sd[k] = sd[src]
+        a2b.model.load_state_dict(sd, strict=True)
+        a2b.model.to(resolve_device()).eval()
+        _bt_model = a2b
+        log("beat_this: render grids from Beat This! final0")
+    except Exception as e:  # noqa: BLE001 — garnish: librosa grids remain
+        _bt_failed = True
+        log(f"beat_this unavailable ({e}); render grids stay librosa")
+    return _bt_model
+
+
+def _bt_bar_grid(stems, sr, offset_s, stems_dir=None, part=None, ref_bars=None):
+    """Bar grid (absolute seconds) for a stem window from Beat This!, or
+    (None, info) to keep librosa's. The beats are fitted to ONE tempo — the
+    render tiles and stretches against a constant bar, so a grid that only
+    fits locally is the wrong grid — and bar phase is a vote over the
+    predicted downbeats, which flip to 2-beat "bars" on some windows when
+    taken one by one. Cached beside the stems (keyed on the drum stem's
+    mtime): a seam re-renders, a window doesn't change.
+
+    `ref_bars` (the librosa grid for the same window) is the sanity check:
+    the bar lengths must agree at 1x, or at 2x/0.5x — librosa's octave errors,
+    where Beat This! is the one that's right. Any other ratio (a swung edit
+    read at 3/2 tempo) is a metrical guess, and librosa's grid stays."""
+    import numpy as np
+
+    def _checked(rel, info):
+        if not rel:
+            return None, info
+        ref_sp = [y - x for x, y in zip(ref_bars or [], (ref_bars or [])[1:]) if 0.4 < (y - x) < 8.0]
+        if len(ref_sp) >= 4 and len(rel) >= 2:
+            ratio = (rel[1] - rel[0]) / float(np.median(ref_sp))
+            if not any(abs(ratio / m - 1.0) <= 0.04 for m in (1.0, 2.0, 0.5)):
+                return None, {**(info or {}), "why": "tempo-disagree", "ratio": round(ratio, 3)}
+        return [offset_s + b for b in rel], info
+
+    # Gate BEFORE the cache: the kill switch (and a lean/weightless image
+    # sharing the stem cache) must never pick up grids a Beat This! worker
+    # left beside the stems.
+    if not BEAT_THIS_ON or not os.path.exists(BEAT_THIS_WEIGHTS):
+        return None, None
+    drums_mtime = None
+    cache_path =os.path.join(stems_dir, f"bt-grid-{part}.json") if stems_dir and part else None
+    if cache_path:
+        try:
+            drums_mtime = os.path.getmtime(os.path.join(stems_dir, f"{part}-drums.flac"))
+            with open(cache_path) as f:
+                c = json.load(f)
+            if c.get("v") == BEAT_THIS_GRID_VERSION and c.get("mtime") == drums_mtime:
+                return _checked(c.get("bars_rel"), c.get("info"))
+        except (OSError, ValueError):
+            pass
+
+    a2b = _bt_load()
+    if a2b is None:
+        return None, None
+    info = {}
+    rel = None
+    try:
+        n = min(s.shape[0] for s in stems.values())
+        mix = sum(s[:n].mean(axis=1) for s in stems.values()).astype(np.float32)
+        beats, downs = a2b(mix, sr)
+        beats = np.asarray(beats, dtype=float)
+        downs = np.asarray(downs, dtype=float)
+        if len(beats) < 16:
+            info = {"why": "few-beats", "n": int(len(beats))}
+        else:
+            ibi = np.diff(beats)
+            p0 = float(np.median(ibi))
+            if not 0.25 <= p0 <= 1.5:
+                info = {"why": "tempo", "ibi": round(p0, 3)}
+            else:
+                idx = np.concatenate([[0], np.cumsum(np.round(ibi / p0))])
+                A = np.vstack([np.ones_like(idx), idx]).T
+                t0, per = np.linalg.lstsq(A, beats, rcond=None)[0]
+                p90 = float(np.percentile(np.abs(beats - (t0 + per * idx)), 90))
+                info = {"bpm": round(60.0 / per, 2), "p90_ms": round(p90 * 1000.0, 1)}
+                if p90 > BEAT_THIS_FIT_P90_S:
+                    info["why"] = "loose-fit"
+                else:
+                    votes = np.zeros(4)
+                    for d in downs:
+                        k = int(round((d - t0) / per))
+                        if abs(d - (t0 + per * k)) < 0.07:
+                            votes[k % 4] += 1
+                    # No usable downbeats: fall back to the first predicted
+                    # beat, i.e. librosa's convention.
+                    phase = int(np.argmax(votes)) if votes.sum() >= 3 else int(idx[0]) % 4
+                    info["phase_share"] = round(float(votes.max() / votes.sum()), 2) if votes.sum() else 0.0
+                    bar = 4.0 * per
+                    first = float(np.mod(t0 + phase * per, bar))
+                    win = n / sr
+                    rel = [round(float(b), 4) for b in np.arange(first, win - 0.05, bar)]
+                    if len(rel) < 5:
+                        rel, info["why"] = None, "short"
+    except Exception as e:  # noqa: BLE001
+        info = {"why": f"error: {e}"}
+        rel = None
+    if cache_path and drums_mtime is not None:
+        try:
+            tmp = cache_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"v": BEAT_THIS_GRID_VERSION, "mtime": drums_mtime, "bars_rel": rel, "info": info}, f)
+            os.replace(tmp, cache_path)
+        except OSError:
+            pass
+    return _checked(rel, info)
+
+
 def _extend_grid(bars_s, *, until_s=None, from_s=None, max_cv=0.04):
     """Extrapolate a bar grid (seconds) forward to `until_s` and/or backward
     to `from_s` at its own median spacing (fork, mixing round 2 — long
@@ -2053,6 +2207,14 @@ def render_transition(req):
     # finally reachable instead of ignored. Equal windows: no-op.
     if dur_s - tail_start_s > OUTRO_SECONDS + 2.0 and out_bars:
         out_bars = _extend_grid(out_bars, from_s=tail_start_s + 0.05)
+    # Beat This! grid over the tail stems themselves (see BEAT_THIS_WEIGHTS)
+    # — spans the whole stem window, so it needs no extension.
+    _bt_out, _bt_out_info = _bt_bar_grid(tail, sr, tail_start_s, out_spec["stems_dir"], "tail", ref_bars=out_bars)
+    _grid_diag = {"grid_out": "bt" if _bt_out else "lr"}
+    if _bt_out_info:
+        _grid_diag["bt_out"] = _bt_out_info
+    if _bt_out:
+        out_bars = _bt_out
     out_vox = [
         (float(r.get("start_ms", 0)) / 1000.0, float(r.get("end_ms", 0)) / 1000.0)
         for r in (outro.get("vocal_ranges") or [])
@@ -2196,14 +2358,17 @@ def render_transition(req):
     # of its bass or melodic ('other') stem energy; the latest such bar is the
     # producer's own transition moment. No such moment → the previous
     # last-full-energy-bar rule stands.
+    # The change must STAY made: every later usable bar keeps the stem under
+    # half. A bass that comes back was a breakdown, not the exit — on a
+    # downbeat-true grid (Beat This!) a one-bar dropout before the drop reads
+    # as a clean 50% fall, and the golden Harpanet cut jumped 24s early into
+    # the breakdown (off-phase librosa bars smeared that dip under 50%).
     _change_pick = None
     for idx in range(len(usable) - 1):
         b1, b2 = usable[idx]
-        nb1, nb2 = usable[idx + 1]
         for nm in ("bass", "other"):
             cur_e = _stem_bar_rms(nm, b1, b2)
-            nxt_e = _stem_bar_rms(nm, nb1, nb2)
-            if cur_e > 1e-3 and nxt_e < 0.5 * cur_e:
+            if cur_e > 1e-3 and all(_stem_bar_rms(nm, nb1, nb2) < 0.5 * cur_e for nb1, nb2 in usable[idx + 1:]):
                 _change_pick = (b1, b2)
                 break
     if _change_pick is not None:
@@ -2238,6 +2403,13 @@ def render_transition(req):
     _in_grid = [b / 1000.0 for b in (in_spec.get("bars") or []) if 0.0 <= b / 1000.0 <= ANALYZE_SECONDS - 1.0]
     if _head_len_s > ANALYZE_SECONDS + 1.0:
         _in_grid = _extend_grid(_in_grid, until_s=_head_len_s - 1.0)
+    _bt_in, _bt_in_info = _bt_bar_grid(head, sr, 0.0, in_spec["stems_dir"], "head", ref_bars=_in_grid)
+    _grid_diag["grid_in"] = "bt" if _bt_in else "lr"
+    if _bt_in_info:
+        _grid_diag["bt_in"] = _bt_in_info
+    if _bt_in:
+        _in_grid = [b for b in _bt_in if b <= _head_len_s - 1.0]
+    log(f"render_transition: grids out={_grid_diag['grid_out']} in={_grid_diag['grid_in']}")
     _head_probe_bars = _in_grid
     _head_bounds = list(zip(_head_probe_bars, _head_probe_bars[1:]))
     _intro_bars = _structural_intro_bars(_melodic_ratio_per_bar(head, _head_bounds, sr)) if len(_head_bounds) >= 4 else 0
@@ -2512,7 +2684,7 @@ def render_transition(req):
     _raw_need = int(n * _rate)
     _avail = tail["drums"].shape[0] - int(_cut_rel * sr)
     _overlap_mode = _avail >= min(_raw_need, int((in_bars[min(_drum_entry + 2, _max_k)] ) * sr))
-    _diag = {}
+    _diag = dict(_grid_diag)
     if _overlap_mode:
         # Kick-onset phase fit. The grid alignment above is only as good as
         # the librosa grids, and measured over the A/B pair set they are NOT

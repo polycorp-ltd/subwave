@@ -128,6 +128,9 @@ ENV KOKORO_MODEL=/opt/kokoro/models/kokoro-v1.0.onnx \
 # torch 2.6.0 publishes cp313 wheels on both indexes, so the shared pin holds.
 ARG WITH_CLAP=0
 ARG WITH_DEMUCS=0
+ARG BEAT_THIS_COMMIT=b95c8ab0c58c2d9fcfd40508ae8dffbc05ac4f5c
+ARG BEAT_THIS_WEIGHTS_REV=39ec64821baf38aa16fafa500a91379c16db0062
+ARG BEAT_THIS_WEIGHTS_SHA256=f758c77ba5d862cad3718a95705964e9af55298b1fb3544c62c9d79184ea0f2e
 ARG WITH_CUDA=0
 RUN TORCH_INDEX="https://download.pytorch.org/whl/cpu" && \
     if [ "$WITH_CUDA" = "1" ]; then TORCH_INDEX="https://download.pytorch.org/whl/cu124"; fi && \
@@ -155,6 +158,21 @@ RUN TORCH_INDEX="https://download.pytorch.org/whl/cpu" && \
         --extra-index-url https://pypi.org/simple \
         torch==2.6.0 torchaudio==2.6.0 demucs==4.0.1 diffq==0.2.4 pyrubberband==0.4.0 && \
       /opt/analyzer/venv/bin/python -c "import torch, demucs, diffq, pyrubberband" && \
+      # Beat This! (fork, mixing round 2): beat/downbeat grids for stem-blend
+      # renders. Code pinned to a commit; --no-deps because its deps (torch,
+      # torchaudio, numpy, soxr) are already here and must not be re-resolved
+      # off PyPI. Weights are baked (not fetched at runtime like CLAP/Demucs):
+      # the authors' JKU host has been unreliable, and the safetensors copy is
+      # pinned to a hub revision AND a sha256 — verified to strict-load into
+      # the official model with trained weights.
+      /opt/analyzer/venv/bin/pip install --no-cache-dir --no-deps \
+        einops==0.8.2 rotary-embedding-torch==0.9.1 \
+        "beat_this @ https://github.com/CPJKU/beat_this/archive/${BEAT_THIS_COMMIT}.zip" && \
+      mkdir -p /opt/analyzer/beat_this && \
+      curl -fsSL -o /opt/analyzer/beat_this/final0.safetensors \
+        "https://huggingface.co/safe-models/beat-this-final0/resolve/${BEAT_THIS_WEIGHTS_REV}/model.safetensors" && \
+      echo "${BEAT_THIS_WEIGHTS_SHA256}  /opt/analyzer/beat_this/final0.safetensors" | sha256sum -c - && \
+      /opt/analyzer/venv/bin/python -c "import beat_this.inference, safetensors" && \
       apt-get purge -y gcc libc6-dev python3-dev && apt-get autoremove -y && rm -rf /var/lib/apt/lists/* ; \
     fi && \
     find /opt/analyzer/venv -depth -type d -name __pycache__ -exec rm -rf {} +
