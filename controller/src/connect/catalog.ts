@@ -418,7 +418,8 @@ export const ENDPOINT_GROUPS: EndpointGroup[] = [
         description:
           'Speak text on air now. mode "raw" reads it verbatim; mode "styled" runs ' +
           'it through the DJ voice first. Optional `sfx` plays a stinger under the ' +
-          'voice. Heavy-ducked over the music.',
+          'voice. Heavy-ducked over the music. `preview: true` returns the line ' +
+          'without airing it.',
         auth: 'admin',
         mutatesAir: true,
         bodyExample: { text: 'Locked in on the frequency — more after this.', mode: 'raw', kind: 'dj-speak' },

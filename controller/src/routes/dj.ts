@@ -705,6 +705,7 @@ router.delete('/dj/skills/:slug', requireAdmin, async (req, res) => {
 // trigger, ignores the settings.sfx.enabled autonomy toggle. A raw line is
 // stamped verbatim so later prompts never read it back (#1908); a styled one is
 // the model's own words and stays in its memory like any other segment.
+// `preview: true` writes the line (styled) or echoes it (raw) without airing.
 router.post('/dj/say', requireAdmin, async (req, res) => {
   const text = (typeof req.body?.text === 'string' ? req.body.text : '').trim().slice(0, SAY_TEXT_MAX);
   if (!text) return res.status(400).json({ error: 'text is required' });
@@ -729,6 +730,13 @@ router.post('/dj/say', requireAdmin, async (req, res) => {
         recap: queue.getDjRecap(),
         recentOpeners: queue.getRecentOpeners(),
       });
+    }
+    // preview: return the line without airing it, so an operator (or a venue,
+    // through Dubplata) can approve the exact words first. Pair with
+    // POST /settings/tts/preview to hear it; air the approved text later with
+    // mode 'raw' so the wording cannot change.
+    if (req.body?.preview === true) {
+      return res.json({ ok: true, mode, kind, spoken, preview: true });
     }
     const outcome = await queue.announce(spoken, kind, mode === 'raw' ? { meta: { ...VERBATIM_META } } : {});
     // Only a styled line can be one (raw is exempt). No voice, so no effect
