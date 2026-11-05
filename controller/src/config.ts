@@ -156,6 +156,12 @@ export const config = {
     // from ICECAST_ADMIN_PASSWORD or state/icecast-secrets.env (listeners.ts).
     adminUrl: envUrl('ICECAST_ADMIN_URL', 'http://broadcast:7702/admin/listclients'),
     adminUser: envStr('ICECAST_ADMIN_USER', 'admin'),
+    // Case-insensitive regex of listener user agents that are not an audience:
+    // an appliance's own monitor (Dubplata's systema plays the stream to the
+    // venue and watches it for silence). Matching sockets are dropped from the
+    // count off the admin feed only, so an admin failure falls back to the raw
+    // sum and the gates fail open as before. Empty = count everyone.
+    ignoreUserAgent: envStr('LISTENER_IGNORE_UA', ''),
   },
   // Offline GeoIP DB (MaxMind MMDB) for the listener-country rollup — the last,
   // opt-in link of the header chain. Empty = no lookup. Env wins over

@@ -179,7 +179,7 @@ async function pollCount(persistHistory: boolean) {
     let current = rawCount;
     if (online && rawCount > 0) {
       try {
-        current = dedupeListeners(await getConnections());
+        current = dedupeListeners(withoutIgnored(await getConnections(), config.icecast.ignoreUserAgent));
       } catch {
         /* admin unreachable / no password — keep the raw status sum */
       }
@@ -465,6 +465,19 @@ function isSafariDouble(ua: string): boolean {
   if (/AppleCoreMedia/i.test(ua)) return true;
   if (!/Safari/i.test(ua) || !/Version\//i.test(ua)) return false;
   return !/(Chrome|CriOS|Chromium|Android|Edg|OPR)/i.test(ua);
+}
+
+// Drops sockets whose user agent matches LISTENER_IGNORE_UA (config.icecast).
+// A bad pattern counts everyone rather than throwing out of the poll.
+export function withoutIgnored(conns: ListenerConnection[], pattern: string): ListenerConnection[] {
+  if (!pattern) return conns;
+  let re: RegExp;
+  try {
+    re = new RegExp(pattern, 'i');
+  } catch {
+    return conns;
+  }
+  return conns.filter(c => !re.test(c.userAgent));
 }
 
 // Headline count. Shares groupConnections with the admin table so the two
